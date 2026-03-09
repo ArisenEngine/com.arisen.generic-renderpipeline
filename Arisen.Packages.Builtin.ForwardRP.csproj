@@ -30,4 +30,4 @@
     </None>
   </ItemGroup>
 
-<PropertyGroup Condition="'$(Configuration)' == 'Debug'"><OutputPath>..\..\..\Projects\VisualStudio\CSharpEngineTest\Outputs\Debug\Packages\Builtin\ForwardRP\</OutputPath></PropertyGroup><PropertyGroup Condition="'$(Configuration)' == 'Release'"><OutputPath>..\..\..\Projects\VisualStudio\CSharpEngineTest\Outputs\Release\Packages\Builtin\ForwardRP\</OutputPath></PropertyGroup></Project>
+</Project>
