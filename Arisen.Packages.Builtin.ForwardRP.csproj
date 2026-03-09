@@ -13,15 +13,13 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\..\Engine\ArisenEngine.csproj">
+    <ProjectReference Include="$(ArisenEngineProject)">
       <Private>false</Private>
     </ProjectReference>
-    <ProjectReference Include="..\..\..\AutoBinding\AutoBinding.csproj">
+    <ProjectReference Include="$(AutoBindingProject)">
       <Private>false</Private>
     </ProjectReference>
-    <ProjectReference Include="..\..\..\Serialization\Serialization\Serialization.csproj">
-      <Private>false</Private>
-    </ProjectReference>
+
   </ItemGroup>
 
   <ItemGroup>
