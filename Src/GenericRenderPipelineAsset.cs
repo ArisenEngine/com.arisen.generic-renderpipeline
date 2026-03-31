@@ -4,12 +4,12 @@ using ArisenEngine.Core.Packages;
 
 namespace ArisenEngine.Rendering;
 
-[ArisenPackage("com.arisen.builtin.forward-rp")]
-public class ForwardRenderPipelineAsset : RenderPipelineAsset
+[ArisenPackage("com.arisen.generic-renderpipeline")]
+public class GenericRenderPipelineAsset : RenderPipelineAsset
 {
     protected override RenderPipeline CreatePipeline()
     {
-        return new ForwardRenderPipeline();
+        return new GenericRenderPipeline();
     }
 
     protected override void BeforeSerialize() { }
