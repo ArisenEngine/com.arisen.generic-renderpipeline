@@ -1,15 +1,13 @@
 {
-    "id": "com.arisen.generic-renderpipeline",
-    "name": "Arisen Generic RP",
-    "version": "1.0.0",
-    "description": "Generic Rendering Pipeline for Arisen Engine",
-    "author": "Arisen Team",
-    "tags": [
-        "rendering",
-        "builtin"
-    ],
-    "engineVersion": "0.1.0",
-    "dependencies": {
-        "com.arisen.rendering": "1.0.0"
-    }
+  "id": "com.arisen.generic-renderpipeline",
+  "name": "Arisen Generic RP",
+  "version": "1.0.0",
+  "author": "Arisen Team",
+  "description": "Generic Rendering Pipeline for Arisen Engine",
+  "entry": {
+    "assembly": "Com.Arisen.GenericRenderpipeline.dll"
+  },
+  "dependencies": {
+    "com.arisen.rendering": "1.0.0"
+  }
 }
