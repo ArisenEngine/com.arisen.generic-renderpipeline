@@ -4,6 +4,7 @@ using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Threading;
 using ArisenKernel.Services;
 using ArisenKernel.Lifecycle;
+using ArisenEngine.Core.Math;
 
 namespace ArisenEngine.Rendering;
 
@@ -11,10 +12,10 @@ public class GenericRenderPipeline : RenderPipeline
 {
     private RHICommandBufferPool? m_CommandPool;
 
-    protected override void Render(RenderContext context, Camera[] cameras)
+    protected override void Render(RenderContext context, ReadOnlySpan<Camera> cameras)
     {
         // 1. Get the TaskGraph system for parallel recording
-        var taskSystem = ArisenKernel.Lifecycle.EngineBootstrapper.Instance?.GetService<ITaskGraph>();
+        var taskSystem = EngineKernel.Instance.Services.GetService<ITaskGraph>();
         if (taskSystem == null) return;
 
         // 2. Build the RenderGraph (In a real scenario, this is cached)

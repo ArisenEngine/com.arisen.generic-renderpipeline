@@ -1,6 +1,6 @@
 using ArisenEngine.Core.Diagnostics;
 
-using ArisenEngine.Core.Packages;
+using ArisenKernel.Packages;
 
 namespace ArisenEngine.Rendering;
 
