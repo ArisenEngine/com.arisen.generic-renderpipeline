@@ -12,11 +12,11 @@ public class GenericRenderPipeline : RenderPipeline
 {
     private RHICommandBufferPool? m_CommandPool;
 
-    protected override void Render(RenderContext context, ReadOnlySpan<Camera> cameras)
+    protected override ulong Render(RenderContext context, ReadOnlySpan<Camera> cameras)
     {
         // 1. Get the TaskGraph system for parallel recording
         var taskSystem = EngineKernel.Instance.Services.GetService<ITaskGraph>();
-        if (taskSystem == null) return;
+        if (taskSystem == null) return 0;
 
         // 2. Build the RenderGraph (In a real scenario, this is cached)
         using var renderGraph = new RenderGraph(taskSystem);
@@ -25,8 +25,9 @@ public class GenericRenderPipeline : RenderPipeline
         var clear = renderGraph.AddPass(new ClearPass(new Color(0.1f, 0.1f, 0.1f, 1.0f)));
         
         // 4. Compile and Execute the graph
-        renderGraph.Execute(context);
+        return renderGraph.Execute(context);
     }
+
 
     protected override void OnDisposed()
     {
