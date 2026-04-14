@@ -10,22 +10,17 @@ namespace ArisenEngine.Rendering;
 
 public class GenericRenderPipeline : RenderPipeline
 {
-    private RHICommandBufferPool? m_CommandPool;
+    private readonly Color m_ClearColor;
 
-    protected override ulong Render(RenderContext context, ReadOnlySpan<Camera> cameras)
+    public GenericRenderPipeline(Color clearColor)
     {
-        // 1. Get the TaskGraph system for parallel recording
-        var taskSystem = EngineKernel.Instance.Services.GetService<ITaskGraph>();
-        if (taskSystem == null) return 0;
+        m_ClearColor = clearColor;
+    }
 
-        // 2. Build the RenderGraph (In a real scenario, this is cached)
-        using var renderGraph = new RenderGraph(taskSystem);
-
-        // 3. Add passes
-        var clear = renderGraph.AddPass(new ClearPass(new Color(0.1f, 0.1f, 0.1f, 1.0f)));
-        
-        // 4. Compile and Execute the graph
-        return renderGraph.Execute(context);
+    protected override void SetupGraph(RenderGraph graph, RenderContext context, ReadOnlySpan<Camera> cameras)
+    {
+        // 1. Add the clear pass as the first step in the frame
+        graph.AddPass(new ClearPass(m_ClearColor, "GenericClearPass"));
     }
 
 
