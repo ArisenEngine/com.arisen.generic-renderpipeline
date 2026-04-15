@@ -20,7 +20,12 @@ public class GenericRenderPipeline : RenderPipeline
     protected override void SetupGraph(RenderGraph graph, RenderContext context, ReadOnlySpan<Camera> cameras)
     {
         // 1. Add the clear pass as the first step in the frame
-        graph.AddPass(new ClearPass(m_ClearColor, "GenericClearPass"));
+        var clear = graph.AddPass(new ClearPass(m_ClearColor, "GenericClearPass"));
+
+        // 2. Add the geometry pass and ensure it runs AFTER the clear pass finishes
+        var geometry = graph.AddPass(new GeometryPass("GenericGeometryPass"));
+        
+        graph.AddDependency(clear, geometry);
     }
 
 
