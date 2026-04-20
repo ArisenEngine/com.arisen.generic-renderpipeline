@@ -5,7 +5,8 @@
   "author": "Arisen Team",
   "description": "Generic Rendering Pipeline for Arisen Engine",
   "entry": {
-    "assembly": "Com.Arisen.GenericRenderpipeline.dll"
+    "assembly": "Com.Arisen.GenericRenderpipeline.dll",
+    "class": "ArisenEngine.Rendering.GenericRenderPipelinePackage"
   },
   "dependencies": {
     "com.arisen.rendering": "1.0.0"
