@@ -19,6 +19,9 @@ public class GenericRenderPipelinePackage : IPackageEntry
         // In the future, this will be loaded from the ProjectSettings asset via AssetDatabase.
         m_DefaultAsset = new GenericRenderPipelineAsset();
         
+        // Instrumented check: This will appear in the Console/Terminal even if redirection is delayed
+        Console.WriteLine($"[DEBUG] GenericRP Loading - ClearColor from Asset: {m_DefaultAsset.ClearColor}");
+
         // This effectively "turns on" the rendering logic for the project.
         Graphics.SetCurrentRenderPipeline(m_DefaultAsset);
         

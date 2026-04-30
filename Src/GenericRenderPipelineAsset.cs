@@ -8,7 +8,7 @@ namespace ArisenEngine.Rendering;
 [ArisenPackage("com.arisen.generic-renderpipeline")]
 public class GenericRenderPipelineAsset : RenderPipelineAsset
 {
-    public Color ClearColor = new Color(0.1f, 0.1f, 1f, 1.0f);
+    public Color ClearColor = new Color(1.0f, 0.4f, 0.7f, 1.0f);
 
     protected override void AfterDeserialize()
     {
