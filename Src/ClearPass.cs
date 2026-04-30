@@ -1,7 +1,7 @@
 using ArisenEngine.Core.RHI;
 using ArisenEngine.Core.Math;
 using Arisen.Native.RHI;
-using System.Diagnostics;
+using System;
 
 namespace ArisenEngine.Rendering;
 
@@ -23,6 +23,19 @@ public sealed class ClearPass : RenderPassNode
         // We use the SwapChain's current image view for clearing
         var colorImageView = context.SwapChain.GetImageView(context.FrameIndex);
         
+        // 1.a Transition the image layout to COLOR_ATTACHMENT_OPTIMAL.
+        // Dynamic rendering does not perform automatic layout transitions. We MUST transition it explicitly.
+        commandBuffer.TransitionImageLayout(context.TargetImage, EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        // Phase 5: Pass specific recording
+        // We use BeginRendering (Vulkan Dynamic Rendering) for the clear operation.
+        
+        // Diagnostic Log: Verify if this is actually running and what color it's using
+        if (context.FrameIndex % 60 == 0)
+        {
+            ArisenEngine.Core.Diagnostics.Logger.Log($"[ClearPass] Record | Surface: 0x{context.SurfaceId:X} | Color: ({m_ClearColor.r:F2}, {m_ClearColor.g:F2}, {m_ClearColor.b:F2}, {m_ClearColor.a:F2}) | ImageView: 0x{colorImageView.Index:X}");
+        }
+
         commandBuffer.BeginRendering(
             colorImageView, 
             EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,

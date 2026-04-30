@@ -19,6 +19,11 @@ public class GenericRenderPipeline : RenderPipeline
 
     protected override void SetupGraph(RenderGraph graph, RenderContext context, ReadOnlySpan<Camera> cameras)
     {
+        if (context.FrameIndex % 60 == 0)
+        {
+            ArisenEngine.Core.Diagnostics.Logger.Log($"[GenericRenderPipeline] SetupGraph | Frame: {context.FrameIndex} | Surface: 0x{context.SurfaceId:X} | ClearColor: {m_ClearColor}");
+        }
+
         // 1. Add the clear pass as the first step in the frame
         var clear = graph.AddPass(new ClearPass(m_ClearColor, "GenericClearPass"));
 
