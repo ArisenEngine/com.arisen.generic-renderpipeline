@@ -15,11 +15,16 @@ public sealed class GeometryPass : RenderPassNode
 
     protected override void Record(RenderContext context, RHICommandBuffer commandBuffer)
     {
+        // B11: Shared Output Coordination.
+        // In the GenericRenderPipeline, ClearPass has already acquired ownership from EXTERNAL
+        // and transitioned to COLOR_ATTACHMENT_OPTIMAL. We do not re-acquire here.
+        bool isSharedOutput = (context.SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0;
+
         if (!context.DrawList.IsEmpty)
         {
             // 1. Begin rendering with "Load" Op for color (preserving the Clear pass results)
             var colorImageView = context.SwapChain.GetImageView(context.FrameIndex);
-            
+
             commandBuffer.BeginRendering(
                 colorImageView,
                 EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -38,13 +43,6 @@ public sealed class GeometryPass : RenderPassNode
             {
                 if (!cmd.VertexBuffer.IsValid) continue;
 
-                // In a full implementation, we would bind the material's pipeline here.
-                // For the first draw call, we assume a default state is already set or 
-                // handled by the RenderGraph's pass setup.
-                
-                // TODO: BindPipeline(cmd.Pipeline);
-                // TODO: PushConstants(cmd.LocalToWorld);
-
                 commandBuffer.BindVertexBuffers(cmd.VertexBuffer);
                 if (cmd.IndexBuffer.IsValid)
                 {
@@ -57,9 +55,21 @@ public sealed class GeometryPass : RenderPassNode
             commandBuffer.EndRendering();
         }
 
-        // 5. IMPORTANT: Transition the image layout to SHADER_READ_ONLY_OPTIMAL for Avalonia / Presentation.
-        // We MUST transition from COLOR_ATTACHMENT_OPTIMAL to SHADER_READ_ONLY_OPTIMAL
-        // to ensure the pixels we just rendered (or cleared) are preserved.
-        commandBuffer.TransitionImageLayout(context.TargetImage, EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, EImageLayout.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        // 5. Finalize: Transition to SHADER_READ_ONLY_OPTIMAL layout for presentation.
+        // CRITICAL: This must happen even if the draw list was empty, to ensure the 
+        // ClearPass results reach the compositor and the image is released back to D3D11.
+        if (isSharedOutput)
+        {
+            commandBuffer.TransitionImageLayout(context.TargetImage,
+                EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                EImageLayout.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                RHIQueueFamily.Ignored, RHIQueueFamily.External);
+        }
+        else
+        {
+            commandBuffer.TransitionImageLayout(context.TargetImage,
+                EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                EImageLayout.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
     }
 }
