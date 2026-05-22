@@ -55,21 +55,22 @@ public sealed class GeometryPass : RenderPassNode
             commandBuffer.EndRendering();
         }
 
-        // 5. Finalize: Transition to SHADER_READ_ONLY_OPTIMAL layout for presentation.
-        // CRITICAL: This must happen even if the draw list was empty, to ensure the 
-        // ClearPass results reach the compositor and the image is released back to D3D11.
+        // 5. Finalize: Transition to the layout expected by Avalonia's Vulkan compositor.
+        // The official Avalonia Vulkan interop sample presents imported Vulkan images from
+        // TRANSFER_SRC_OPTIMAL. This must happen even if the draw list was empty so ClearPass
+        // output is visible and the image ownership is released to the external compositor.
         if (isSharedOutput)
         {
             commandBuffer.TransitionImageLayout(context.TargetImage,
                 EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                EImageLayout.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 RHIQueueFamily.Ignored, RHIQueueFamily.External);
         }
         else
         {
             commandBuffer.TransitionImageLayout(context.TargetImage,
                 EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                EImageLayout.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         }
     }
 }
