@@ -1,0 +1,6 @@
+{
+  "entry": {
+    "assembly": "Com.Arisen.GenericRenderpipeline.dll",
+    "class": "ArisenEngine.Rendering.GenericRenderPipelinePackage"
+  }
+}
