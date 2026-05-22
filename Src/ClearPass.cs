@@ -1,7 +1,6 @@
-using ArisenEngine.Core.RHI;
 using ArisenEngine.Core.Math;
+using ArisenEngine.Core.RHI;
 using Arisen.Native.RHI;
-using System;
 
 namespace ArisenEngine.Rendering;
 
@@ -19,34 +18,9 @@ public sealed class ClearPass : RenderPassNode
 
     protected override void Record(RenderContext context, RHICommandBuffer commandBuffer)
     {
-        // 1. Begin dynamic rendering (modern Vulkan/RHI path)
-        // We use the SwapChain's current image view for clearing
+        // 1. Begin dynamic rendering (modern Vulkan/RHI path).
+        // Output acquire/layout policy is owned by PrepareFrameTargetPass.
         var colorImageView = context.SwapChain.GetImageView(context.FrameIndex);
-
-        // Virtual surfaces (editor viewport) export their swapchain images via a Win32 NT handle
-        // for D3D11/Avalonia composition. Vulkan->D3D11 requires an explicit queue-family
-        // ownership acquire from VK_QUEUE_FAMILY_EXTERNAL at frame start, and a matching release
-        // at frame end. Non-virtual surfaces (native windows) keep the in-family path.
-        bool isSharedOutput = (context.SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0;
-
-        // 1.a Transition the image layout to COLOR_ATTACHMENT_OPTIMAL.
-        // We use UNDEFINED as the old layout because we are clearing the entire image anyway.
-        if (isSharedOutput)
-        {
-            // B11: For shared surfaces, we MUST acquire ownership back from External (D3D11)
-            // if it was released in the previous frame. Using UNDEFINED as oldLayout safely
-            // handles both the first frame and subsequent re-acquires.
-            commandBuffer.TransitionImageLayout(context.TargetImage,
-                EImageLayout.IMAGE_LAYOUT_UNDEFINED,
-                EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                RHIQueueFamily.External, RHIQueueFamily.Ignored);
-        }
-        else
-        {
-            commandBuffer.TransitionImageLayout(context.TargetImage,
-                EImageLayout.IMAGE_LAYOUT_UNDEFINED,
-                EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        }
 
         // Phase 5: Pass specific recording
         // We use BeginRendering (Vulkan Dynamic Rendering) for the clear operation.

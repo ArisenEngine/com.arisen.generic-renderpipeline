@@ -1,6 +1,5 @@
 using Arisen.Native.RHI;
 using ArisenEngine.Core.RHI;
-using System;
 
 namespace ArisenEngine.Rendering;
 
@@ -15,11 +14,6 @@ public sealed class GeometryPass : RenderPassNode
 
     protected override void Record(RenderContext context, RHICommandBuffer commandBuffer)
     {
-        // B11: Shared Output Coordination.
-        // In the GenericRenderPipeline, ClearPass has already acquired ownership from EXTERNAL
-        // and transitioned to COLOR_ATTACHMENT_OPTIMAL. We do not re-acquire here.
-        bool isSharedOutput = (context.SurfaceId & RHISystem.VirtualSurfaceIDMask) != 0;
-
         if (!context.DrawList.IsEmpty)
         {
             // 1. Begin rendering with "Load" Op for color (preserving the Clear pass results)
@@ -55,22 +49,6 @@ public sealed class GeometryPass : RenderPassNode
             commandBuffer.EndRendering();
         }
 
-        // 5. Finalize: Transition to the layout expected by Avalonia's Vulkan compositor.
-        // The official Avalonia Vulkan interop sample presents imported Vulkan images from
-        // TRANSFER_SRC_OPTIMAL. This must happen even if the draw list was empty so ClearPass
-        // output is visible and the image ownership is released to the external compositor.
-        if (isSharedOutput)
-        {
-            commandBuffer.TransitionImageLayout(context.TargetImage,
-                EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                RHIQueueFamily.Ignored, RHIQueueFamily.External);
-        }
-        else
-        {
-            commandBuffer.TransitionImageLayout(context.TargetImage,
-                EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                EImageLayout.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        }
+        // Output finalization is owned by FinalOutputPass so geometry remains a pure scene pass.
     }
 }

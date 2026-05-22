@@ -1,9 +1,3 @@
-using Arisen.Native.RHI;
-using ArisenEngine.Core.RHI;
-using ArisenEngine.Core.Diagnostics;
-using ArisenEngine.Threading;
-using ArisenKernel.Services;
-using ArisenKernel.Lifecycle;
 using ArisenEngine.Core.Math;
 
 namespace ArisenEngine.Rendering;
@@ -24,15 +18,17 @@ public class GenericRenderPipeline : RenderPipeline
             ArisenEngine.Core.Diagnostics.Logger.Log($"[GenericRenderPipeline] SetupGraph | Frame: {context.FrameIndex} | Surface: 0x{context.SurfaceId:X} | ClearColor: {m_ClearColor}");
         }
 
-        // 1. Add the clear pass as the first step in the frame
-        var clear = graph.AddPass(new ClearPass(m_ClearColor, "GenericClearPass"));
+                        // 1. Clear writes the frame color target.
+        graph.AddPass(
+            new ClearPass(m_ClearColor, "GenericClearPass"),
+            builder => builder.Write(graph.FrameColor));
 
-        // 2. Add the geometry pass and ensure it runs AFTER the clear pass finishes
-        var geometry = graph.AddPass(new GeometryPass("GenericGeometryPass"));
-        
-        graph.AddDependency(clear, geometry);
+        // 2. Geometry reads the cleared frame color and writes updated color.
+        // The RenderGraph derives Clear -> Geometry from these resource declarations.
+        graph.AddPass(
+            new GeometryPass("GenericGeometryPass"),
+            builder => builder.Read(graph.FrameColor).Write(graph.FrameColor));
     }
-
 
     protected override void OnDisposed()
     {
