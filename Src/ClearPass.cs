@@ -16,7 +16,7 @@ public sealed class ClearPass : RenderPassNode
         m_ClearColor = color;
     }
 
-    protected override void Record(RenderContext context, RHICommandBuffer commandBuffer)
+    protected override void Record(RenderContext context, RenderCommandList commandList)
     {
         // 1. Begin dynamic rendering (modern Vulkan/RHI path).
         // Output acquire/layout policy is owned by PrepareFrameTargetPass.
@@ -31,7 +31,7 @@ public sealed class ClearPass : RenderPassNode
             ArisenEngine.Core.Diagnostics.Logger.Log($"[ClearPass] Record | Surface: 0x{context.SurfaceId:X} | Color: ({m_ClearColor.r:F2}, {m_ClearColor.g:F2}, {m_ClearColor.b:F2}, {m_ClearColor.a:F2}) | ImageView: 0x{colorImageView.Index:X}");
         }
 
-        commandBuffer.BeginRendering(
+        commandList.BeginRendering(
             colorImageView,
             EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             EAttachmentLoadOp.ATTACHMENT_LOAD_OP_CLEAR,
@@ -41,7 +41,7 @@ public sealed class ClearPass : RenderPassNode
         );
 
         // 2. End rendering
-        commandBuffer.EndRendering();
+        commandList.EndRendering();
 
         // B11: Finalize Layout.
         // We leave the image in COLOR_ATTACHMENT_OPTIMAL. 
