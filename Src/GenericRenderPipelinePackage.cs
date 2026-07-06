@@ -1,6 +1,7 @@
 using ArisenKernel.Packages;
 using ArisenKernel.Services;
 using ArisenKernel.Diagnostics;
+using ArisenEngine.Core.Assets;
 
 namespace ArisenEngine.Rendering;
 
@@ -15,9 +16,11 @@ public class GenericRenderPipelinePackage : IPackageEntry
     {
         KernelLog.Info("[GenericRP] Initializing default render pipeline asset...");
 
+        var assetDatabase = registry.GetService<IAssetDatabase>();
+
         // For development, we auto-instantiate the asset if one isn't already assigned.
         // In the future, this will be loaded from the ProjectSettings asset via AssetDatabase.
-        m_DefaultAsset = new GenericRenderPipelineAsset();
+        m_DefaultAsset = new GenericRenderPipelineAsset(assetDatabase);
         
         // Instrumented check: This will appear in the Console/Terminal even if redirection is delayed
         Console.WriteLine($"[DEBUG] GenericRP Loading - ClearColor from Asset: {m_DefaultAsset.ClearColor}");
