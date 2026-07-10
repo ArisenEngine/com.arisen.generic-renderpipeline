@@ -16,6 +16,9 @@
     "com.arisen.rendering": "1.0.0"
   },
   "services": {
+    "provides": [
+      "ArisenEngine.Rendering.IRenderMaterialLibrary"
+    ],
     "requires": [
       "ArisenEngine.Core.Assets.IAssetDatabase"
     ]

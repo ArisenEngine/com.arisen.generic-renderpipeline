@@ -85,7 +85,7 @@ public sealed class GeometryPass : RenderPassNode
             if (cmd.IndexBuffer.IsValid)
             {
                 commandList.BindIndexBuffer(cmd.IndexBuffer, 0, cmd.IndexType);
-                commandList.DrawIndexed(cmd.IndexCount);
+                commandList.DrawIndexed(cmd.IndexCount, firstIndex: cmd.FirstIndex, vertexOffset: cmd.VertexOffset);
             }
         }
 
