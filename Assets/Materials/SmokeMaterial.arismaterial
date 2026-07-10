@@ -1,0 +1,33 @@
+Name: GenericRP/SmokeMaterial
+Shader:
+  Guid: 54bdea4a-0af3-4cd5-aa4f-fcfb15e65117
+  Name: GenericRP/SmokeStaticMesh
+  Variant:
+    Backend: Vulkan
+    TargetEnvironment: vulkan1.3
+    ShaderModel: 6_4
+    OptimizationLevel: 0
+    DebugInfo: true
+Texture2DRefs:
+- Name: BaseColor
+  Slot: 0
+  Texture:
+    Guid: c320bf66-0495-4e70-8f27-d54e90dd6c8d
+    Name: GenericRP/SmokeChecker
+    Variant:
+      Format: R8G8B8A8UNorm
+      ColorSpace: SRgb
+      GenerateMipMaps: false
+    SourceFormat: PpmP3
+ScalarProperties:
+- Name: MetallicFactor
+  Value: 0
+- Name: RoughnessFactor
+  Value: 1
+Vector4Properties:
+- Name: BaseColorFactor
+  Value:
+    X: 1
+    Y: 1
+    Z: 1
+    W: 1

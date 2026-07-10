@@ -45,7 +45,7 @@ public sealed class ClearPass : RenderPassNode
 
         // B11: Finalize Layout.
         // We leave the image in COLOR_ATTACHMENT_OPTIMAL. 
-        // Subsequent passes (like GeometryPass) will continue writing to it.
+        // Subsequent passes continue writing to it.
         // The FINAL pass in the pipeline is responsible for transitioning to SHADER_READ_ONLY_OPTIMAL
         // and releasing ownership to EXTERNAL.
     }
