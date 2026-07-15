@@ -18,6 +18,34 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
 
     public uint DefaultMaterialID { get; private set; }
 
+    public int MaterialCount
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return m_Materials.Count;
+        }
+    }
+
+    public int PreparedMaterialCount
+    {
+        get
+        {
+            ThrowIfDisposed();
+
+            int preparedCount = 0;
+            for (int i = 0; i < m_Materials.Count; i++)
+            {
+                if (m_Materials[i].Resource is { IsValid: true })
+                {
+                    preparedCount++;
+                }
+            }
+
+            return preparedCount;
+        }
+    }
+
     public GenericRenderMaterialLibrary(
         IAssetDatabase assetDatabase,
         DeferredRenderResourceDisposalQueue disposalQueue)

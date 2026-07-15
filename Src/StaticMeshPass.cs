@@ -24,7 +24,13 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     private readonly IAssetDatabase m_AssetDatabase;
     private RHIFactory m_Factory;
     private Matrix4x4 m_ViewProjection = Matrix4x4.Identity;
+    private Matrix4x4 m_ShadowViewProjection = Matrix4x4.Identity;
+    private Vector3 m_CameraPosition = Vector3.Zero;
     private Matrix4x4 m_FallbackLocalToWorld = Matrix4x4.Identity;
+    private DirectionalLight m_DirectionalLight = DirectionalLight.Default;
+    private SceneEnvironment m_SceneEnvironment = SceneEnvironment.Default;
+    private StaticMeshLightingConstants m_LightingConstants = StaticMeshLightingConstants.Default;
+    private StaticMeshShadowConstants m_ShadowConstants = StaticMeshShadowConstants.Disabled;
     private StaticMeshMaterialConstants m_FallbackMaterialConstants = StaticMeshMaterialConstants.Default;
     private StaticMeshMaterialSlot[] m_MaterialSlots = Array.Empty<StaticMeshMaterialSlot>();
     private StaticMeshPipelineBatch[] m_PipelineBatches = Array.Empty<StaticMeshPipelineBatch>();
@@ -32,15 +38,21 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     private StaticMeshBatchWorkItem[] m_WorkItems = Array.Empty<StaticMeshBatchWorkItem>();
     private MeshDrawCommand[] m_PreparedDraws = Array.Empty<MeshDrawCommand>();
     private StaticMeshObjectData[] m_ObjectData = Array.Empty<StaticMeshObjectData>();
-    private int[] m_BatchDrawCounts = Array.Empty<int>();
-    private int[] m_BatchWriteOffsets = Array.Empty<int>();
+    private PointLight[] m_PointLights = Array.Empty<PointLight>();
+    private SpotLight[] m_SpotLights = Array.Empty<SpotLight>();
     private int[] m_BatchedDrawIndices = Array.Empty<int>();
+    private StaticMeshDrawSortKey[] m_BatchedDrawSortKeys = Array.Empty<StaticMeshDrawSortKey>();
     private StaticMeshDrawConstants m_FallbackDrawConstants = StaticMeshDrawConstants.Identity;
     private StaticMeshObjectBufferSlot[] m_ObjectDataBufferSlots = Array.Empty<StaticMeshObjectBufferSlot>();
     private RHIBufferHandle m_ObjectDataBuffer = RHIBufferHandle.Invalid;
     private uint m_ObjectDataBufferBindlessIndex = InvalidBindlessIndex;
     private int m_ObjectDataBufferCapacity;
     private int m_ObjectDataCount;
+    private int m_SceneDataCount;
+    private int m_PointLightDataStart;
+    private int m_PointLightCount;
+    private int m_SpotLightDataStart;
+    private int m_SpotLightCount;
     private int m_ObjectDataRingSize;
     private int m_ObjectDataSlotIndex;
     private RHIBufferHandle m_VertexBuffer = RHIBufferHandle.Invalid;
@@ -49,6 +61,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     private uint m_FirstIndex;
     private uint m_IndexCount;
     private int m_VertexOffset;
+    private RHIImageViewHandle m_ColorTargetImageView = RHIImageViewHandle.Invalid;
+    private EFormat m_ColorTargetFormat = EFormat.FORMAT_UNDEFINED;
+    private bool m_EncodeOutputToSrgb;
     private EFormat m_ColorFormat = EFormat.FORMAT_UNDEFINED;
     private EFormat m_DepthFormat = EFormat.FORMAT_UNDEFINED;
     private RHIImageHandle m_DepthImage = RHIImageHandle.Invalid;
@@ -61,6 +76,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     private int m_DrawBatchCount;
     private int m_WorkItemCount;
     private int m_PreparedDrawCount;
+    private int m_OpaqueDrawCount;
+    private int m_AlphaTestDrawCount;
+    private int m_TransparentDrawCount;
     private int m_FallbackPipelineBatchIndex = -1;
     private uint m_MaterialSlotVersion;
     private uint m_PreparedMaterialSlotVersion;
@@ -141,7 +159,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             return;
         }
 
-        var colorImageView = context.SwapChain.GetImageView(context.FrameIndex);
+        var colorImageView = GetColorTargetImageView(context);
 
         if (context.FrameIndex % 60 == 0)
         {
@@ -219,7 +237,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
 
         int preparedDrawCount = m_PreparedDrawCount;
         var drawIndexEnd = Math.Min(m_BatchedDrawIndices.Length, workItem.DrawIndexStart + workItem.DrawIndexCount);
-        var colorImageView = context.SwapChain.GetImageView(context.FrameIndex);
+        var colorImageView = GetColorTargetImageView(context);
 
         BeginStaticMeshRendering(context, commandList, colorImageView, clearDepth: firstWorkItem);
         RecordObjectDataBarrier(commandList);
@@ -246,11 +264,20 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
 
             var materialConstants = GetMaterialConstants(draw.MaterialID);
             var constants = StaticMeshDrawConstants.From(
-                materialConstants.ImageIndex,
-                materialConstants.SamplerIndex,
                 materialConstants.BaseColorFactor,
+                m_LightingConstants,
+                m_CameraPosition,
+                materialConstants.MetallicFactor,
+                materialConstants.RoughnessFactor,
+                materialConstants.BaseColorImageIndex,
+                materialConstants.BaseColorSamplerIndex,
+                materialConstants.NormalImageIndex,
+                materialConstants.NormalSamplerIndex,
                 m_ObjectDataBufferBindlessIndex,
-                checked((uint)drawIndex));
+                checked((uint)drawIndex),
+                checked((uint)m_PointLightDataStart),
+                PackLocalLightCounts(m_PointLightCount, m_SpotLightCount),
+                m_EncodeOutputToSrgb);
 
             commandList.PushConstants(
                 constants,
@@ -307,14 +334,28 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     public void Prepare(RenderContext context)
     {
         var factory = context.Device.GetFactory();
-        var colorFormat = factory.GetImageViewFormat(context.SwapChain.GetImageView(context.FrameIndex));
+        var colorFormat = m_ColorTargetFormat != EFormat.FORMAT_UNDEFINED
+            ? m_ColorTargetFormat
+            : factory.GetImageViewFormat(context.SwapChain.GetImageView(context.FrameIndex));
         var depthFormat = DepthTargetFormat;
+        var encodeOutputToSrgb = RenderOutputEncoding.RequiresExplicitSrgbEncoding(colorFormat);
+        if (m_EncodeOutputToSrgb != encodeOutputToSrgb)
+        {
+            m_EncodeOutputToSrgb = encodeOutputToSrgb;
+            RefreshFallbackDrawConstants();
+        }
 
         EnsureDepthTarget(factory, context.Width, context.Height, depthFormat);
         EnsurePipelineBatches(context, colorFormat, depthFormat);
         BuildDrawBatches(context);
         PrepareObjectDataBuffer(context, factory);
         PlotBatchDiagnostics();
+    }
+
+    public void SetColorTarget(RHIImageViewHandle imageView, EFormat format)
+    {
+        m_ColorTargetImageView = imageView;
+        m_ColorTargetFormat = format;
     }
 
     public void SetPreparedDraws(ReadOnlySpan<MeshDrawCommand> drawCommands)
@@ -536,17 +577,20 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     {
         m_DrawBatchCount = 0;
         m_WorkItemCount = 0;
+        m_OpaqueDrawCount = 0;
+        m_AlphaTestDrawCount = 0;
+        m_TransparentDrawCount = 0;
 
         if (m_PreparedDrawCount <= 0 || m_PipelineBatchCount <= 0)
         {
             return;
         }
 
-        EnsureBatchScratchCapacity(m_PreparedDrawCount, m_PipelineBatchCount);
-        EnsureDrawBatchCapacity(m_PipelineBatchCount);
-        Array.Clear(m_BatchDrawCounts, 0, m_PipelineBatchCount);
+        EnsureBatchScratchCapacity(m_PreparedDrawCount);
+        EnsureDrawBatchCapacity(m_PreparedDrawCount);
 
         int preparedDrawCount = m_PreparedDrawCount;
+        int sortedDrawCount = 0;
         for (int i = 0; i < preparedDrawCount; i++)
         {
             ref readonly var draw = ref m_PreparedDraws[i];
@@ -558,41 +602,47 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             int batchIndex = GetMaterialPipelineBatchIndex(draw.MaterialID);
             if (batchIndex >= 0)
             {
-                m_BatchDrawCounts[batchIndex]++;
+                var renderQueue = GetMaterialRenderQueue(draw.MaterialID);
+                m_BatchedDrawSortKeys[sortedDrawCount] = StaticMeshDrawSortKey.From(
+                    renderQueue,
+                    batchIndex,
+                    draw,
+                    checked((uint)i));
+                m_BatchedDrawIndices[sortedDrawCount] = i;
+                IncrementRenderQueueCount(renderQueue.Class);
+                sortedDrawCount++;
             }
         }
 
-        int drawIndexOffset = 0;
-        for (int batchIndex = 0; batchIndex < m_PipelineBatchCount; batchIndex++)
+        if (sortedDrawCount <= 0)
         {
-            int batchDrawCount = m_BatchDrawCounts[batchIndex];
-            m_BatchWriteOffsets[batchIndex] = drawIndexOffset;
-            if (batchDrawCount <= 0)
-            {
-                continue;
-            }
-
-            m_DrawBatches[m_DrawBatchCount++] = new StaticMeshDrawBatch(batchIndex, drawIndexOffset, batchDrawCount);
-            drawIndexOffset += batchDrawCount;
+            return;
         }
 
-        for (int i = 0; i < preparedDrawCount; i++)
+        Array.Sort(m_BatchedDrawSortKeys, m_BatchedDrawIndices, 0, sortedDrawCount);
+
+        int batchStart = 0;
+        int currentPipelineBatchIndex = m_BatchedDrawSortKeys[0].PipelineBatchIndex;
+        for (int sortedIndex = 1; sortedIndex < sortedDrawCount; sortedIndex++)
         {
-            ref readonly var draw = ref m_PreparedDraws[i];
-            if (!IsDrawable(draw))
+            int pipelineBatchIndex = m_BatchedDrawSortKeys[sortedIndex].PipelineBatchIndex;
+            if (pipelineBatchIndex == currentPipelineBatchIndex)
             {
                 continue;
             }
 
-            int batchIndex = GetMaterialPipelineBatchIndex(draw.MaterialID);
-            if (batchIndex < 0)
-            {
-                continue;
-            }
-
-            int writeIndex = m_BatchWriteOffsets[batchIndex]++;
-            m_BatchedDrawIndices[writeIndex] = i;
+            m_DrawBatches[m_DrawBatchCount++] = new StaticMeshDrawBatch(
+                currentPipelineBatchIndex,
+                batchStart,
+                sortedIndex - batchStart);
+            batchStart = sortedIndex;
+            currentPipelineBatchIndex = pipelineBatchIndex;
         }
+
+        m_DrawBatches[m_DrawBatchCount++] = new StaticMeshDrawBatch(
+            currentPipelineBatchIndex,
+            batchStart,
+            sortedDrawCount - batchStart);
 
         BuildBatchWorkItems();
     }
@@ -645,21 +695,16 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         }
     }
 
-    private void EnsureBatchScratchCapacity(int drawCount, int pipelineBatchCount)
+    private void EnsureBatchScratchCapacity(int drawCount)
     {
         if (m_BatchedDrawIndices.Length < drawCount)
         {
             Array.Resize(ref m_BatchedDrawIndices, drawCount);
         }
 
-        if (m_BatchDrawCounts.Length < pipelineBatchCount)
+        if (m_BatchedDrawSortKeys.Length < drawCount)
         {
-            Array.Resize(ref m_BatchDrawCounts, pipelineBatchCount);
-        }
-
-        if (m_BatchWriteOffsets.Length < pipelineBatchCount)
-        {
-            Array.Resize(ref m_BatchWriteOffsets, pipelineBatchCount);
+            Array.Resize(ref m_BatchedDrawSortKeys, drawCount);
         }
     }
 
@@ -677,13 +722,32 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             activeBatchCount = 1;
         }
 
+        int opaqueDrawCount = m_OpaqueDrawCount;
+        if (m_PreparedDrawCount == 0 && m_FallbackPipelineBatchIndex >= 0)
+        {
+            opaqueDrawCount = 1;
+        }
+
         Profiler.PlotValue("StaticMeshPass.DrawCount", effectiveDrawCount);
         Profiler.PlotValue("StaticMeshPass.MaterialBatchCount", activeBatchCount);
+        Profiler.PlotValue("StaticMeshPass.OpaqueDrawCount", opaqueDrawCount);
+        Profiler.PlotValue("StaticMeshPass.AlphaTestDrawCount", m_AlphaTestDrawCount);
+        Profiler.PlotValue("StaticMeshPass.TransparentDrawCount", m_TransparentDrawCount);
         Profiler.PlotValue("StaticMeshPass.PipelineBatchCount", m_PipelineBatchCount);
         Profiler.PlotValue("StaticMeshPass.WorkItemCount", m_WorkItemCount);
         Profiler.PlotValue("StaticMeshPass.ObjectDataCount", m_ObjectDataCount);
+        Profiler.PlotValue("StaticMeshPass.PointLightCount", m_PointLightCount);
+        Profiler.PlotValue("StaticMeshPass.SpotLightCount", m_SpotLightCount);
+        Profiler.PlotValue("StaticMeshPass.SceneDataCount", m_SceneDataCount);
         Profiler.PlotValue("StaticMeshPass.ObjectDataCapacity", m_ObjectDataBufferCapacity);
         Profiler.PlotValue("StaticMeshPass.ObjectDataRingSize", m_ObjectDataRingSize);
+    }
+
+    private RHIImageViewHandle GetColorTargetImageView(RenderContext context)
+    {
+        return m_ColorTargetImageView.IsValid
+            ? m_ColorTargetImageView
+            : context.SwapChain.GetImageView(context.FrameIndex);
     }
 
     private void LogBatchDrawCount(StaticMeshBatchWorkItem workItem)
@@ -717,11 +781,20 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         m_FallbackMaterialConstants = materialConstants;
         SetMaterialSlot(0, material);
         m_FallbackDrawConstants = StaticMeshDrawConstants.From(
-            materialConstants.ImageIndex,
-            materialConstants.SamplerIndex,
             materialConstants.BaseColorFactor,
+            m_LightingConstants,
+            m_CameraPosition,
+            materialConstants.MetallicFactor,
+            materialConstants.RoughnessFactor,
+            materialConstants.BaseColorImageIndex,
+            materialConstants.BaseColorSamplerIndex,
+            materialConstants.NormalImageIndex,
+            materialConstants.NormalSamplerIndex,
             m_ObjectDataBufferBindlessIndex,
-            0);
+            0,
+            checked((uint)m_PointLightDataStart),
+            PackLocalLightCounts(m_PointLightCount, m_SpotLightCount),
+            m_EncodeOutputToSrgb);
         m_VertexBuffer = mesh.VertexBuffer;
         m_IndexBuffer = mesh.IndexBuffer;
         m_IndexType = mesh.IndexType;
@@ -747,10 +820,12 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         int previousPipelineBatchIndex = m_MaterialSlots[slotIndex].IsValid
             ? m_MaterialSlots[slotIndex].PipelineBatchIndex
             : -1;
+        var renderQueue = RenderQueuePolicy.Resolve(material.RenderState, material.Shader.VariantKeywords);
         var slot = new StaticMeshMaterialSlot(
             material.Shader,
             material.ShaderDependencyStamp,
             material.RenderState,
+            renderQueue,
             CreateMaterialConstants(material),
             previousPipelineBatchIndex);
 
@@ -767,6 +842,71 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     {
         m_ViewProjection = viewProjection;
         RefreshFallbackDrawConstants();
+    }
+
+    public void SetCameraPosition(Vector3 cameraPosition)
+    {
+        m_CameraPosition = cameraPosition;
+        RefreshFallbackDrawConstants();
+    }
+
+    public void SetDirectionalLight(DirectionalLight light)
+    {
+        m_DirectionalLight = light.IsValid ? light : DirectionalLight.Default;
+        m_LightingConstants = StaticMeshLightingConstants.From(
+            m_DirectionalLight,
+            m_SceneEnvironment);
+        RefreshFallbackDrawConstants();
+    }
+
+    public void SetPointLights(ReadOnlySpan<PointLight> pointLights)
+    {
+        int pointLightCount = Math.Min(pointLights.Length, PointLightSnapshotExtractor.MaxPointLightsPerFrame);
+        if (m_PointLights.Length < pointLightCount)
+        {
+            Array.Resize(ref m_PointLights, pointLightCount);
+        }
+
+        pointLights.Slice(0, pointLightCount).CopyTo(m_PointLights);
+        m_PointLightCount = pointLightCount;
+        RefreshFallbackDrawConstants();
+    }
+
+    public void SetSpotLights(ReadOnlySpan<SpotLight> spotLights)
+    {
+        int spotLightCount = Math.Min(spotLights.Length, SpotLightSnapshotExtractor.MaxSpotLightsPerFrame);
+        if (m_SpotLights.Length < spotLightCount)
+        {
+            Array.Resize(ref m_SpotLights, spotLightCount);
+        }
+
+        spotLights.Slice(0, spotLightCount).CopyTo(m_SpotLights);
+        m_SpotLightCount = spotLightCount;
+        RefreshFallbackDrawConstants();
+    }
+
+    public void SetSceneEnvironment(SceneEnvironment environment)
+    {
+        m_SceneEnvironment = environment.IsValid ? environment : SceneEnvironment.Default;
+        m_LightingConstants = StaticMeshLightingConstants.From(
+            m_DirectionalLight,
+            m_SceneEnvironment);
+        RefreshFallbackDrawConstants();
+    }
+
+    public void SetDirectionalShadow(
+        Matrix4x4 shadowViewProjection,
+        uint shadowImageIndex,
+        uint shadowSamplerIndex,
+        float texelSize,
+        bool enabled)
+    {
+        m_ShadowViewProjection = shadowViewProjection;
+        m_ShadowConstants = StaticMeshShadowConstants.From(
+            shadowImageIndex,
+            shadowSamplerIndex,
+            texelSize,
+            enabled);
     }
 
     public void SetFallbackLocalToWorld(Matrix4x4 localToWorld)
@@ -866,35 +1006,66 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         int objectCount = m_PreparedDrawCount > 0
             ? m_PreparedDrawCount
             : m_FallbackPipelineBatchIndex >= 0 ? 1 : 0;
+        int pointLightCount = objectCount > 0 ? m_PointLightCount : 0;
+        int spotLightCount = objectCount > 0 ? m_SpotLightCount : 0;
+        int sceneDataCount = checked(objectCount + pointLightCount + spotLightCount);
 
         m_ObjectDataCount = objectCount;
-        if (objectCount <= 0)
+        m_PointLightDataStart = objectCount;
+        m_SpotLightDataStart = objectCount + pointLightCount;
+        m_SceneDataCount = sceneDataCount;
+        if (sceneDataCount <= 0)
         {
             m_ObjectDataBuffer = RHIBufferHandle.Invalid;
             m_ObjectDataBufferBindlessIndex = InvalidBindlessIndex;
             m_ObjectDataBufferCapacity = 0;
+            m_PointLightDataStart = 0;
+            m_SpotLightDataStart = 0;
             return;
         }
 
         EnsureObjectDataRing(factory, GetObjectDataRingSize(context));
         m_ObjectDataSlotIndex = checked((int)(context.FrameIndex % (uint)m_ObjectDataRingSize));
 
-        EnsureObjectDataCapacity(objectCount);
+        EnsureObjectDataCapacity(sceneDataCount);
         if (m_PreparedDrawCount > 0)
         {
             int preparedDrawCount = m_PreparedDrawCount;
             for (int i = 0; i < preparedDrawCount; i++)
             {
-                m_ObjectData[i] = StaticMeshObjectData.From(m_PreparedDraws[i].LocalToWorld, m_ViewProjection);
+                var materialConstants = GetMaterialConstants(m_PreparedDraws[i].MaterialID);
+                m_ObjectData[i] = StaticMeshObjectData.From(
+                    m_PreparedDraws[i].LocalToWorld,
+                    m_ViewProjection,
+                    m_ShadowViewProjection,
+                    m_ShadowConstants,
+                    materialConstants.EmissiveFactor,
+                    materialConstants.EmissiveTextureIndices);
             }
         }
         else
         {
-            m_ObjectData[0] = StaticMeshObjectData.From(m_FallbackLocalToWorld, m_ViewProjection);
+            m_ObjectData[0] = StaticMeshObjectData.From(
+                m_FallbackLocalToWorld,
+                m_ViewProjection,
+                m_ShadowViewProjection,
+                m_ShadowConstants,
+                m_FallbackMaterialConstants.EmissiveFactor,
+                m_FallbackMaterialConstants.EmissiveTextureIndices);
         }
 
-        EnsureObjectDataBuffer(factory, m_ObjectDataSlotIndex, objectCount);
-        UploadObjectData(objectCount);
+        for (int i = 0; i < pointLightCount; i++)
+        {
+            m_ObjectData[objectCount + i] = StaticMeshObjectData.From(m_PointLights[i]);
+        }
+
+        for (int i = 0; i < spotLightCount; i++)
+        {
+            m_ObjectData[m_SpotLightDataStart + i] = StaticMeshObjectData.From(m_SpotLights[i]);
+        }
+
+        EnsureObjectDataBuffer(factory, m_ObjectDataSlotIndex, sceneDataCount);
+        UploadObjectData(sceneDataCount);
 
         if (m_PreparedDrawCount <= 0)
         {
@@ -1012,7 +1183,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
 
     private void RecordObjectDataBarrier(RenderCommandList commandList)
     {
-        if (!m_ObjectDataBuffer.IsValid || m_ObjectDataCount <= 0)
+        if (!m_ObjectDataBuffer.IsValid || m_SceneDataCount <= 0)
         {
             return;
         }
@@ -1026,12 +1197,14 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             DstQueueFamilyIndex = RHIQueueFamily.Ignored,
             Buffer = m_ObjectDataBuffer,
             SrcStageMask = EPipelineStageFlagBits.PIPELINE_STAGE_HOST_BIT,
-            DstStageMask = EPipelineStageFlagBits.PIPELINE_STAGE_VERTEX_SHADER_BIT
+            DstStageMask = EPipelineStageFlagBits.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                           EPipelineStageFlagBits.PIPELINE_STAGE_FRAGMENT_SHADER_BIT
         };
 
         commandList.PipelineBarrier(
             EPipelineStageFlagBits.PIPELINE_STAGE_HOST_BIT,
-            EPipelineStageFlagBits.PIPELINE_STAGE_VERTEX_SHADER_BIT,
+            EPipelineStageFlagBits.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            EPipelineStageFlagBits.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
             barriers);
     }
 
@@ -1049,6 +1222,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         m_ObjectDataBufferBindlessIndex = InvalidBindlessIndex;
         m_ObjectDataBufferCapacity = 0;
         m_ObjectDataCount = 0;
+        m_SceneDataCount = 0;
+        m_PointLightDataStart = 0;
+        m_SpotLightDataStart = 0;
     }
 
     private void ReleaseObjectDataBufferSlot(int slotIndex)
@@ -1115,24 +1291,56 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     private void RefreshFallbackDrawConstants()
     {
         m_FallbackDrawConstants = StaticMeshDrawConstants.From(
-            m_FallbackMaterialConstants.ImageIndex,
-            m_FallbackMaterialConstants.SamplerIndex,
             m_FallbackMaterialConstants.BaseColorFactor,
+            m_LightingConstants,
+            m_CameraPosition,
+            m_FallbackMaterialConstants.MetallicFactor,
+            m_FallbackMaterialConstants.RoughnessFactor,
+            m_FallbackMaterialConstants.BaseColorImageIndex,
+            m_FallbackMaterialConstants.BaseColorSamplerIndex,
+            m_FallbackMaterialConstants.NormalImageIndex,
+            m_FallbackMaterialConstants.NormalSamplerIndex,
             m_ObjectDataBufferBindlessIndex,
-            0);
+            0,
+            checked((uint)m_PointLightDataStart),
+            PackLocalLightCounts(m_PointLightCount, m_SpotLightCount),
+            m_EncodeOutputToSrgb);
+    }
+
+    private static uint PackLocalLightCounts(int pointLightCount, int spotLightCount)
+    {
+        return ((uint)pointLightCount & 0xFFFFu) |
+               (((uint)spotLightCount & 0xFFFFu) << 16);
     }
 
     private static StaticMeshMaterialConstants CreateMaterialConstants(RHIMaterialResource material)
     {
-        var textureConstants = material.GetTexture2DConstants(GenericRenderPipelineAssetRefs.SmokeMaterial.Texture2DSlots.BaseColor);
+        var baseColorTexture = material.GetTexture2DConstants(MaterialTextureSlots.BaseColor);
+        var normalTexture = material.TryGetTexture2DConstants(MaterialTextureSlots.Normal, out var normalConstants)
+            ? normalConstants
+            : baseColorTexture;
+        var hasEmissiveTexture = material.TryGetTexture2DConstants(MaterialTextureSlots.Emissive, out var emissiveTexture);
         var baseColorFactor = material.GetVector4PropertyOrDefault(
-            GenericRenderPipelineAssetRefs.SmokeMaterial.Vector4Properties.BaseColorFactor,
+            MaterialPropertySlots.BaseColorFactor,
             Vector4.One);
+        var metallicFactor = material.GetScalarPropertyOrDefault(MaterialPropertySlots.MetallicFactor, 0.0f);
+        var roughnessFactor = material.GetScalarPropertyOrDefault(MaterialPropertySlots.RoughnessFactor, 1.0f);
+        var emissiveFactor = material.GetVector4PropertyOrDefault(
+            MaterialPropertySlots.EmissiveFactor,
+            Vector4.Zero);
 
         return new StaticMeshMaterialConstants(
-            textureConstants.ImageIndex,
-            textureConstants.SamplerIndex,
-            baseColorFactor);
+            baseColorFactor,
+            emissiveFactor,
+            metallicFactor,
+            roughnessFactor,
+            baseColorTexture.ImageIndex,
+            baseColorTexture.SamplerIndex,
+            normalTexture.ImageIndex,
+            normalTexture.SamplerIndex,
+            hasEmissiveTexture ? emissiveTexture.ImageIndex : 0,
+            hasEmissiveTexture ? emissiveTexture.SamplerIndex : 0,
+            hasEmissiveTexture ? 1u : 0u);
     }
 
     private StaticMeshMaterialConstants GetMaterialConstants(uint materialId)
@@ -1161,6 +1369,36 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         }
 
         return m_FallbackPipelineBatchIndex;
+    }
+
+    private RenderQueueInfo GetMaterialRenderQueue(uint materialId)
+    {
+        if (materialId < (uint)m_MaterialSlots.Length)
+        {
+            var slot = m_MaterialSlots[(int)materialId];
+            if (slot.IsValid)
+            {
+                return slot.RenderQueue;
+            }
+        }
+
+        return RenderQueueInfo.Opaque;
+    }
+
+    private void IncrementRenderQueueCount(RenderQueueClass queueClass)
+    {
+        switch (queueClass)
+        {
+            case RenderQueueClass.Opaque:
+                m_OpaqueDrawCount++;
+                break;
+            case RenderQueueClass.AlphaTest:
+                m_AlphaTestDrawCount++;
+                break;
+            case RenderQueueClass.Transparent:
+                m_TransparentDrawCount++;
+                break;
+        }
     }
 
     private static bool IsDrawable(in MeshDrawCommand draw)
@@ -1246,6 +1484,95 @@ internal readonly struct StaticMeshBatchWorkItem
     }
 }
 
+internal readonly struct StaticMeshDrawSortKey : IComparable<StaticMeshDrawSortKey>
+{
+    public readonly ushort RenderQueue;
+    public readonly int PipelineBatchIndex;
+    public readonly uint MaterialID;
+    public readonly uint VertexBufferIndex;
+    public readonly uint VertexBufferGeneration;
+    public readonly uint IndexBufferIndex;
+    public readonly uint IndexBufferGeneration;
+    public readonly uint FirstIndex;
+    public readonly int VertexOffset;
+    public readonly uint SourceDrawIndex;
+
+    private StaticMeshDrawSortKey(
+        ushort renderQueue,
+        int pipelineBatchIndex,
+        uint materialId,
+        uint vertexBufferIndex,
+        uint vertexBufferGeneration,
+        uint indexBufferIndex,
+        uint indexBufferGeneration,
+        uint firstIndex,
+        int vertexOffset,
+        uint sourceDrawIndex)
+    {
+        RenderQueue = renderQueue;
+        PipelineBatchIndex = pipelineBatchIndex;
+        MaterialID = materialId;
+        VertexBufferIndex = vertexBufferIndex;
+        VertexBufferGeneration = vertexBufferGeneration;
+        IndexBufferIndex = indexBufferIndex;
+        IndexBufferGeneration = indexBufferGeneration;
+        FirstIndex = firstIndex;
+        VertexOffset = vertexOffset;
+        SourceDrawIndex = sourceDrawIndex;
+    }
+
+    public static StaticMeshDrawSortKey From(
+        RenderQueueInfo renderQueue,
+        int pipelineBatchIndex,
+        in MeshDrawCommand draw,
+        uint sourceDrawIndex)
+    {
+        return new StaticMeshDrawSortKey(
+            renderQueue.Value,
+            pipelineBatchIndex,
+            draw.MaterialID,
+            draw.VertexBuffer.Index,
+            draw.VertexBuffer.Generation,
+            draw.IndexBuffer.Index,
+            draw.IndexBuffer.Generation,
+            draw.FirstIndex,
+            draw.VertexOffset,
+            sourceDrawIndex);
+    }
+
+    public int CompareTo(StaticMeshDrawSortKey other)
+    {
+        int result = RenderQueue.CompareTo(other.RenderQueue);
+        if (result != 0) return result;
+
+        result = PipelineBatchIndex.CompareTo(other.PipelineBatchIndex);
+        if (result != 0) return result;
+
+        result = MaterialID.CompareTo(other.MaterialID);
+        if (result != 0) return result;
+
+        result = VertexBufferIndex.CompareTo(other.VertexBufferIndex);
+        if (result != 0) return result;
+
+        result = VertexBufferGeneration.CompareTo(other.VertexBufferGeneration);
+        if (result != 0) return result;
+
+        result = IndexBufferIndex.CompareTo(other.IndexBufferIndex);
+        if (result != 0) return result;
+
+        result = IndexBufferGeneration.CompareTo(other.IndexBufferGeneration);
+        if (result != 0) return result;
+
+        result = FirstIndex.CompareTo(other.FirstIndex);
+        if (result != 0) return result;
+
+        result = VertexOffset.CompareTo(other.VertexOffset);
+        if (result != 0) return result;
+
+        return SourceDrawIndex.CompareTo(other.SourceDrawIndex);
+    }
+}
+
 internal readonly struct StaticMeshObjectBufferSlot
 {
     public readonly RHIBufferHandle Buffer;
@@ -1267,6 +1594,7 @@ internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
     public readonly ShaderAsset? Shader;
     public readonly AssetDependencyStamp ShaderDependencyStamp;
     public readonly MaterialRenderState RenderState;
+    public readonly RenderQueueInfo RenderQueue;
     public readonly StaticMeshMaterialConstants Constants;
     public int PipelineBatchIndex;
     public readonly bool IsValid;
@@ -1275,12 +1603,14 @@ internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
         ShaderAsset shader,
         AssetDependencyStamp shaderDependencyStamp,
         MaterialRenderState renderState,
+        RenderQueueInfo renderQueue,
         StaticMeshMaterialConstants constants,
         int pipelineBatchIndex)
     {
         Shader = shader;
         ShaderDependencyStamp = shaderDependencyStamp;
         RenderState = renderState;
+        RenderQueue = renderQueue;
         Constants = constants;
         PipelineBatchIndex = pipelineBatchIndex;
         IsValid = true;
@@ -1292,6 +1622,7 @@ internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
                ReferenceEquals(Shader, other.Shader) &&
                ShaderDependencyStamp == other.ShaderDependencyStamp &&
                RenderState == other.RenderState &&
+               RenderQueue == other.RenderQueue &&
                Constants.Equals(other.Constants) &&
                PipelineBatchIndex == other.PipelineBatchIndex;
     }
@@ -1307,6 +1638,7 @@ internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
             Shader,
             ShaderDependencyStamp,
             RenderState,
+            RenderQueue,
             Constants,
             PipelineBatchIndex,
             IsValid);
@@ -1316,24 +1648,60 @@ internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
 [StructLayout(LayoutKind.Sequential)]
 internal readonly struct StaticMeshMaterialConstants : IEquatable<StaticMeshMaterialConstants>
 {
-    public static StaticMeshMaterialConstants Default => new(0, 0, Vector4.One);
+    public static StaticMeshMaterialConstants Default => new(Vector4.One, Vector4.Zero, 0.0f, 1.0f, 0, 0, 0, 0, 0, 0, 0);
 
-    public readonly uint ImageIndex;
-    public readonly uint SamplerIndex;
     public readonly Vector4 BaseColorFactor;
+    public readonly Vector4 EmissiveFactor;
+    public readonly float MetallicFactor;
+    public readonly float RoughnessFactor;
+    public readonly uint BaseColorImageIndex;
+    public readonly uint BaseColorSamplerIndex;
+    public readonly uint NormalImageIndex;
+    public readonly uint NormalSamplerIndex;
+    public readonly uint EmissiveImageIndex;
+    public readonly uint EmissiveSamplerIndex;
+    public readonly uint HasEmissiveTexture;
+    public Vector4 EmissiveTextureIndices => new(EmissiveImageIndex, EmissiveSamplerIndex, HasEmissiveTexture, 0.0f);
 
-    public StaticMeshMaterialConstants(uint imageIndex, uint samplerIndex, Vector4 baseColorFactor)
+    public StaticMeshMaterialConstants(
+        Vector4 baseColorFactor,
+        Vector4 emissiveFactor,
+        float metallicFactor,
+        float roughnessFactor,
+        uint baseColorImageIndex,
+        uint baseColorSamplerIndex,
+        uint normalImageIndex,
+        uint normalSamplerIndex,
+        uint emissiveImageIndex,
+        uint emissiveSamplerIndex,
+        uint hasEmissiveTexture)
     {
-        ImageIndex = imageIndex;
-        SamplerIndex = samplerIndex;
         BaseColorFactor = baseColorFactor;
+        EmissiveFactor = emissiveFactor;
+        MetallicFactor = metallicFactor;
+        RoughnessFactor = roughnessFactor;
+        BaseColorImageIndex = baseColorImageIndex;
+        BaseColorSamplerIndex = baseColorSamplerIndex;
+        NormalImageIndex = normalImageIndex;
+        NormalSamplerIndex = normalSamplerIndex;
+        EmissiveImageIndex = emissiveImageIndex;
+        EmissiveSamplerIndex = emissiveSamplerIndex;
+        HasEmissiveTexture = hasEmissiveTexture;
     }
 
     public bool Equals(StaticMeshMaterialConstants other)
     {
-        return ImageIndex == other.ImageIndex &&
-               SamplerIndex == other.SamplerIndex &&
-               BaseColorFactor.Equals(other.BaseColorFactor);
+        return BaseColorFactor.Equals(other.BaseColorFactor) &&
+               EmissiveFactor.Equals(other.EmissiveFactor) &&
+               MetallicFactor.Equals(other.MetallicFactor) &&
+               RoughnessFactor.Equals(other.RoughnessFactor) &&
+               BaseColorImageIndex == other.BaseColorImageIndex &&
+               BaseColorSamplerIndex == other.BaseColorSamplerIndex &&
+               NormalImageIndex == other.NormalImageIndex &&
+               NormalSamplerIndex == other.NormalSamplerIndex &&
+               EmissiveImageIndex == other.EmissiveImageIndex &&
+               EmissiveSamplerIndex == other.EmissiveSamplerIndex &&
+               HasEmissiveTexture == other.HasEmissiveTexture;
     }
 
     public override bool Equals(object? obj)
@@ -1343,7 +1711,95 @@ internal readonly struct StaticMeshMaterialConstants : IEquatable<StaticMeshMate
 
     public override int GetHashCode()
     {
-        return HashCode.Combine(ImageIndex, SamplerIndex, BaseColorFactor);
+        var hash = new HashCode();
+        hash.Add(BaseColorFactor);
+        hash.Add(EmissiveFactor);
+        hash.Add(MetallicFactor);
+        hash.Add(RoughnessFactor);
+        hash.Add(BaseColorImageIndex);
+        hash.Add(BaseColorSamplerIndex);
+        hash.Add(NormalImageIndex);
+        hash.Add(NormalSamplerIndex);
+        hash.Add(EmissiveImageIndex);
+        hash.Add(EmissiveSamplerIndex);
+        hash.Add(HasEmissiveTexture);
+        return hash.ToHashCode();
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal readonly struct StaticMeshLightingConstants
+{
+    public static StaticMeshLightingConstants Default => From(
+        DirectionalLight.Default,
+        SceneEnvironment.Default);
+
+    public readonly Vector4 DirectionIntensity;
+    public readonly Vector4 ColorAmbient;
+    public readonly Vector4 EnvironmentAmbient;
+
+    private StaticMeshLightingConstants(
+        Vector4 directionIntensity,
+        Vector4 colorAmbient,
+        Vector4 environmentAmbient)
+    {
+        DirectionIntensity = directionIntensity;
+        ColorAmbient = colorAmbient;
+        EnvironmentAmbient = environmentAmbient;
+    }
+
+    public static StaticMeshLightingConstants From(
+        DirectionalLight light,
+        SceneEnvironment environment)
+    {
+        if (!light.IsValid)
+        {
+            light = DirectionalLight.Default;
+        }
+
+        if (!environment.IsValid)
+        {
+            environment = SceneEnvironment.Default;
+        }
+
+        return new StaticMeshLightingConstants(
+            new Vector4(light.Direction, light.Intensity),
+            new Vector4(light.Color, light.AmbientIntensity),
+            new Vector4(environment.AmbientColor, environment.AmbientIntensity));
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal readonly struct StaticMeshShadowConstants
+{
+    private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
+
+    public static StaticMeshShadowConstants Disabled => new(
+        new Vector4(InvalidBindlessIndex, InvalidBindlessIndex, 0.0f, 0.0f),
+        new Vector4(0.0022f, 0.78f, 1.0f / 2048.0f, 0.0f));
+
+    public readonly Vector4 TextureIndices;
+    public readonly Vector4 Parameters;
+
+    private StaticMeshShadowConstants(Vector4 textureIndices, Vector4 parameters)
+    {
+        TextureIndices = textureIndices;
+        Parameters = parameters;
+    }
+
+    public static StaticMeshShadowConstants From(
+        uint shadowImageIndex,
+        uint shadowSamplerIndex,
+        float texelSize,
+        bool enabled)
+    {
+        bool isEnabled = enabled &&
+                         shadowImageIndex != InvalidBindlessIndex &&
+                         shadowSamplerIndex != InvalidBindlessIndex &&
+                         texelSize > 0.0f;
+        return new StaticMeshShadowConstants(
+            new Vector4(shadowImageIndex, shadowSamplerIndex, 0.0f, 0.0f),
+            new Vector4(0.0022f, 0.78f, texelSize, isEnabled ? 1.0f : 0.0f));
     }
 }
 
@@ -1352,41 +1808,90 @@ internal readonly struct StaticMeshDrawConstants
 {
     private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
 
-    public static StaticMeshDrawConstants Identity => From(0, 0, Vector4.One, InvalidBindlessIndex, 0);
+    public static StaticMeshDrawConstants Identity => From(Vector4.One, StaticMeshLightingConstants.Default, Vector3.Zero, 0.0f, 1.0f, 0, 0, 0, 0, InvalidBindlessIndex, 0, 0, 0, false);
 
     public readonly Vector4 BaseColorFactor;
-    public readonly uint ImageIndex;
-    public readonly uint SamplerIndex;
+    public readonly Vector4 LightDirectionIntensity;
+    public readonly Vector4 LightColorAmbient;
+    public readonly Vector4 EnvironmentAmbient;
+    public readonly Vector4 CameraWorldPosition;
+    public readonly float MetallicFactor;
+    public readonly float RoughnessFactor;
+    public readonly uint BaseColorImageIndex;
+    public readonly uint BaseColorSamplerIndex;
+    public readonly uint NormalImageIndex;
+    public readonly uint NormalSamplerIndex;
     public readonly uint ObjectBufferIndex;
     public readonly uint ObjectIndex;
+    public readonly uint PointLightDataStart;
+    public readonly uint PackedLocalLightCounts;
+    public readonly uint EncodeOutputToSrgb;
 
     private StaticMeshDrawConstants(
-        uint imageIndex,
-        uint samplerIndex,
         Vector4 baseColorFactor,
+        StaticMeshLightingConstants lightingConstants,
+        Vector3 cameraPosition,
+        float metallicFactor,
+        float roughnessFactor,
+        uint baseColorImageIndex,
+        uint baseColorSamplerIndex,
+        uint normalImageIndex,
+        uint normalSamplerIndex,
         uint objectBufferIndex,
-        uint objectIndex)
+        uint objectIndex,
+        uint pointLightDataStart,
+        uint packedLocalLightCounts,
+        bool encodeOutputToSrgb)
     {
         BaseColorFactor = baseColorFactor;
-        ImageIndex = imageIndex;
-        SamplerIndex = samplerIndex;
+        LightDirectionIntensity = lightingConstants.DirectionIntensity;
+        LightColorAmbient = lightingConstants.ColorAmbient;
+        EnvironmentAmbient = lightingConstants.EnvironmentAmbient;
+        CameraWorldPosition = new Vector4(cameraPosition, 1.0f);
+        MetallicFactor = metallicFactor;
+        RoughnessFactor = roughnessFactor;
+        BaseColorImageIndex = baseColorImageIndex;
+        BaseColorSamplerIndex = baseColorSamplerIndex;
+        NormalImageIndex = normalImageIndex;
+        NormalSamplerIndex = normalSamplerIndex;
         ObjectBufferIndex = objectBufferIndex;
         ObjectIndex = objectIndex;
+        PointLightDataStart = pointLightDataStart;
+        PackedLocalLightCounts = packedLocalLightCounts;
+        EncodeOutputToSrgb = encodeOutputToSrgb ? 1u : 0u;
     }
 
     public static StaticMeshDrawConstants From(
-        uint imageIndex,
-        uint samplerIndex,
         Vector4 baseColorFactor,
+        StaticMeshLightingConstants lightingConstants,
+        Vector3 cameraPosition,
+        float metallicFactor,
+        float roughnessFactor,
+        uint baseColorImageIndex,
+        uint baseColorSamplerIndex,
+        uint normalImageIndex,
+        uint normalSamplerIndex,
         uint objectBufferIndex,
-        uint objectIndex)
+        uint objectIndex,
+        uint pointLightDataStart,
+        uint packedLocalLightCounts,
+        bool encodeOutputToSrgb)
     {
         return new StaticMeshDrawConstants(
-            imageIndex,
-            samplerIndex,
             baseColorFactor,
+            lightingConstants,
+            cameraPosition,
+            metallicFactor,
+            roughnessFactor,
+            baseColorImageIndex,
+            baseColorSamplerIndex,
+            normalImageIndex,
+            normalSamplerIndex,
             objectBufferIndex,
-            objectIndex);
+            objectIndex,
+            pointLightDataStart,
+            packedLocalLightCounts,
+            encodeOutputToSrgb);
     }
 }
 
@@ -1400,6 +1905,14 @@ internal readonly struct StaticMeshObjectData
     public readonly Vector4 LocalToWorldColumn0;
     public readonly Vector4 LocalToWorldColumn1;
     public readonly Vector4 LocalToWorldColumn2;
+    public readonly Vector4 ShadowModelViewProjectionColumn0;
+    public readonly Vector4 ShadowModelViewProjectionColumn1;
+    public readonly Vector4 ShadowModelViewProjectionColumn2;
+    public readonly Vector4 ShadowModelViewProjectionColumn3;
+    public readonly Vector4 ShadowTextureIndices;
+    public readonly Vector4 ShadowParameters;
+    public readonly Vector4 EmissiveFactor;
+    public readonly Vector4 EmissiveTextureIndices;
 
     private StaticMeshObjectData(
         Vector4 modelViewProjectionColumn0,
@@ -1408,7 +1921,15 @@ internal readonly struct StaticMeshObjectData
         Vector4 modelViewProjectionColumn3,
         Vector4 localToWorldColumn0,
         Vector4 localToWorldColumn1,
-        Vector4 localToWorldColumn2)
+        Vector4 localToWorldColumn2,
+        Vector4 shadowModelViewProjectionColumn0,
+        Vector4 shadowModelViewProjectionColumn1,
+        Vector4 shadowModelViewProjectionColumn2,
+        Vector4 shadowModelViewProjectionColumn3,
+        Vector4 shadowTextureIndices,
+        Vector4 shadowParameters,
+        Vector4 emissiveFactor,
+        Vector4 emissiveTextureIndices)
     {
         ModelViewProjectionColumn0 = modelViewProjectionColumn0;
         ModelViewProjectionColumn1 = modelViewProjectionColumn1;
@@ -1417,18 +1938,81 @@ internal readonly struct StaticMeshObjectData
         LocalToWorldColumn0 = localToWorldColumn0;
         LocalToWorldColumn1 = localToWorldColumn1;
         LocalToWorldColumn2 = localToWorldColumn2;
+        ShadowModelViewProjectionColumn0 = shadowModelViewProjectionColumn0;
+        ShadowModelViewProjectionColumn1 = shadowModelViewProjectionColumn1;
+        ShadowModelViewProjectionColumn2 = shadowModelViewProjectionColumn2;
+        ShadowModelViewProjectionColumn3 = shadowModelViewProjectionColumn3;
+        ShadowTextureIndices = shadowTextureIndices;
+        ShadowParameters = shadowParameters;
+        EmissiveFactor = emissiveFactor;
+        EmissiveTextureIndices = emissiveTextureIndices;
     }
 
-    public static StaticMeshObjectData From(Matrix4x4 localToWorld, Matrix4x4 viewProjection)
+    public static StaticMeshObjectData From(
+        Matrix4x4 localToWorld,
+        Matrix4x4 viewProjection,
+        Matrix4x4 shadowViewProjection,
+        StaticMeshShadowConstants shadowConstants,
+        Vector4 emissiveFactor,
+        Vector4 emissiveTextureIndices)
     {
         var modelViewProjection = localToWorld * viewProjection;
+        var shadowModelViewProjection = localToWorld * shadowViewProjection;
         return new StaticMeshObjectData(
             new Vector4(modelViewProjection.M11, modelViewProjection.M21, modelViewProjection.M31, modelViewProjection.M41),
             new Vector4(modelViewProjection.M12, modelViewProjection.M22, modelViewProjection.M32, modelViewProjection.M42),
             new Vector4(modelViewProjection.M13, modelViewProjection.M23, modelViewProjection.M33, modelViewProjection.M43),
             new Vector4(modelViewProjection.M14, modelViewProjection.M24, modelViewProjection.M34, modelViewProjection.M44),
-            new Vector4(localToWorld.M11, localToWorld.M21, localToWorld.M31, 0.0f),
-            new Vector4(localToWorld.M12, localToWorld.M22, localToWorld.M32, 0.0f),
-            new Vector4(localToWorld.M13, localToWorld.M23, localToWorld.M33, 0.0f));
+            new Vector4(localToWorld.M11, localToWorld.M21, localToWorld.M31, localToWorld.M41),
+            new Vector4(localToWorld.M12, localToWorld.M22, localToWorld.M32, localToWorld.M42),
+            new Vector4(localToWorld.M13, localToWorld.M23, localToWorld.M33, localToWorld.M43),
+            new Vector4(shadowModelViewProjection.M11, shadowModelViewProjection.M21, shadowModelViewProjection.M31, shadowModelViewProjection.M41),
+            new Vector4(shadowModelViewProjection.M12, shadowModelViewProjection.M22, shadowModelViewProjection.M32, shadowModelViewProjection.M42),
+            new Vector4(shadowModelViewProjection.M13, shadowModelViewProjection.M23, shadowModelViewProjection.M33, shadowModelViewProjection.M43),
+            new Vector4(shadowModelViewProjection.M14, shadowModelViewProjection.M24, shadowModelViewProjection.M34, shadowModelViewProjection.M44),
+            shadowConstants.TextureIndices,
+            shadowConstants.Parameters,
+            emissiveFactor,
+            emissiveTextureIndices);
+    }
+
+    public static StaticMeshObjectData From(PointLight light)
+    {
+        return new StaticMeshObjectData(
+            new Vector4(light.Position, light.Range),
+            new Vector4(light.Color, light.Intensity),
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero);
+    }
+
+    public static StaticMeshObjectData From(SpotLight light)
+    {
+        return new StaticMeshObjectData(
+            new Vector4(light.Position, light.Range),
+            new Vector4(light.Color, light.Intensity),
+            new Vector4(light.Direction, light.InnerConeCosine),
+            new Vector4(light.OuterConeCosine, 0.0f, 0.0f, 0.0f),
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero);
     }
 }
