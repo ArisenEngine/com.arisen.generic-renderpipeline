@@ -21,16 +21,13 @@ public class GenericRenderPipelinePackage : IPackageEntry
         var assetDatabase = registry.GetService<IAssetDatabase>();
         m_DisposalQueue = new DeferredRenderResourceDisposalQueue();
         m_MaterialLibrary = new GenericRenderMaterialLibrary(assetDatabase, m_DisposalQueue);
-        m_MaterialLibrary.RegisterDefaultMaterial(GenericRenderPipelineAssetRefs.SmokeMaterial.Ref);
+        m_MaterialLibrary.RegisterDefaultMaterial(GenericRenderPipelineAssetRefs.StandardLitMaterial.Ref);
         registry.RegisterService<IRenderMaterialLibrary>(m_MaterialLibrary);
 
         // For development, we auto-instantiate the asset if one isn't already assigned.
         // In the future, this will be loaded from the ProjectSettings asset via AssetDatabase.
         m_DefaultAsset = new GenericRenderPipelineAsset(assetDatabase, m_MaterialLibrary, m_DisposalQueue);
         
-        // Instrumented check: This will appear in the Console/Terminal even if redirection is delayed
-        Console.WriteLine($"[DEBUG] GenericRP Loading - ClearColor from Asset: {m_DefaultAsset.ClearColor}");
-
         // This effectively "turns on" the rendering logic for the project.
         Graphics.SetCurrentRenderPipeline(m_DefaultAsset);
         

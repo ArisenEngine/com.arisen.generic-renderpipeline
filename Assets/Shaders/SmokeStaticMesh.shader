@@ -35,6 +35,12 @@ Shader "GenericRP/SmokeStaticMesh"
                 float4 localToWorldColumn0;
                 float4 localToWorldColumn1;
                 float4 localToWorldColumn2;
+                float4 shadowModelViewProjectionColumn0;
+                float4 shadowModelViewProjectionColumn1;
+                float4 shadowModelViewProjectionColumn2;
+                float4 shadowModelViewProjectionColumn3;
+                float4 shadowTextureIndices;
+                float4 shadowParameters;
             };
 
             [[vk::binding(2, 3)]]
@@ -44,8 +50,12 @@ Shader "GenericRP/SmokeStaticMesh"
             struct
             {
                 float4 baseColorFactor;
-                uint imageIndex;
-                uint samplerIndex;
+                float metallicFactor;
+                float roughnessFactor;
+                uint baseColorImageIndex;
+                uint baseColorSamplerIndex;
+                uint normalImageIndex;
+                uint normalSamplerIndex;
                 uint objectBufferIndex;
                 uint objectIndex;
             } DrawConstants;
@@ -91,8 +101,8 @@ Shader "GenericRP/SmokeStaticMesh"
 
             float4 PSMain(VSOutput input) : SV_Target0
             {
-                float4 textureColor = BindlessImages[NonUniformResourceIndex(DrawConstants.imageIndex)].Sample(
-                    BindlessSamplers[NonUniformResourceIndex(DrawConstants.samplerIndex)],
+                float4 textureColor = BindlessImages[NonUniformResourceIndex(DrawConstants.baseColorImageIndex)].Sample(
+                    BindlessSamplers[NonUniformResourceIndex(DrawConstants.baseColorSamplerIndex)],
                     input.UV);
 
                 float3 lightDirection = normalize(float3(0.35, 0.55, 0.76));
