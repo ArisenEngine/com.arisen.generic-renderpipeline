@@ -22,6 +22,12 @@ public class GenericRenderPipeline : RenderPipeline
     private readonly RenderResourceReloadQueue m_ReloadQueue = new();
     private readonly DeferredRenderResourceDisposalQueue m_DisposalQueue;
     private readonly Dictionary<Guid, RHIStaticMeshResource> m_SceneMeshes = new();
+    private RHIEnvironmentTextureResource? m_EnvironmentTexture;
+    private RHIEnvironmentLightingResource? m_EnvironmentLighting;
+    private Guid m_FailedEnvironmentTextureGuid;
+    private AssetDependencyStamp m_FailedEnvironmentTextureStamp = AssetDependencyStamp.Empty;
+    private Guid m_FailedEnvironmentLightingGuid;
+    private AssetDependencyStamp m_FailedEnvironmentLightingStamp = AssetDependencyStamp.Empty;
     private readonly Matrix4x4 m_FallbackStaticMeshLocalToWorld = Matrix4x4.CreateScale(1.24f, 1.24f, 1.0f);
     private MeshDrawCommand[] m_SceneDrawCommands = Array.Empty<MeshDrawCommand>();
     private int m_SceneDrawCommandCount;
@@ -71,6 +77,8 @@ public class GenericRenderPipeline : RenderPipeline
         var preparedDraws = GetPreparedDraws(context);
         var directionalLight = GetPrimaryDirectionalLight(context);
         var sceneEnvironment = GetSceneEnvironment(context, directionalLight);
+        var environmentTexture = EnsureEnvironmentTexture(context, sceneEnvironment);
+        var environmentLighting = EnsureEnvironmentLighting(context, environmentTexture);
         int registeredMaterialCount = m_MaterialLibrary.MaterialCount;
         int preparedMaterialCount = m_MaterialLibrary.PreparedMaterialCount;
         int visibleDrawCommandCount = preparedDraws.Length;
@@ -95,23 +103,25 @@ public class GenericRenderPipeline : RenderPipeline
             1.0f / directionalShadowTarget.Size,
             m_DirectionalShadowPass.HasRenderableShadowMap);
         m_EnvironmentSkyPass.SetEnvironment(sceneEnvironment);
+        m_EnvironmentSkyPass.SetEnvironmentTexture(environmentTexture);
         m_EnvironmentSkyPass.SetColorTarget(
             sceneColorTexture.ImageView,
             sceneColorTexture.Format);
         m_EnvironmentSkyPass.Prepare(context);
         m_StaticMeshPass.SetDirectionalLight(directionalLight);
         m_StaticMeshPass.SetSceneEnvironment(sceneEnvironment);
+        m_StaticMeshPass.SetEnvironmentLighting(environmentLighting);
         m_StaticMeshPass.SetFallbackLocalToWorld(m_FallbackStaticMeshLocalToWorld);
         m_TonemapPass.SetSceneColor(
             sceneColorTexture.Image,
             sceneColorTexture.BindlessImageIndex,
             sceneColorTexture.BindlessSamplerIndex);
-        m_TonemapPass.SetExposure(1.0f);
+        m_TonemapPass.SetExposure(sceneEnvironment.Exposure);
         m_TonemapPass.Prepare(context);
 
         if (context.FrameIndex % 60 == 0)
         {
-            ArisenEngine.Core.Diagnostics.Logger.Log($"[GenericRenderPipeline] SetupGraph | Frame: {context.FrameIndex} | Surface: 0x{context.SurfaceId:X} | Cameras: {context.CameraCount} | DirectionalLights: {context.DirectionalLightCount} | PointLights: {context.PointLightCount} | SpotLights: {context.SpotLightCount} | Environments: {context.SceneEnvironmentCount} | Materials: {preparedMaterialCount}/{registeredMaterialCount} prepared | LegacyDraws: {context.DrawListCount} | SceneItems: {m_StaticMeshCullingStats.SourceItemCount} | VisibleItems: {m_StaticMeshCullingStats.VisibleItemCount} | CulledItems: {m_StaticMeshCullingStats.CulledItemCount} | VisibleDrawCommands: {visibleDrawCommandCount} | SceneColor: {sceneColorTexture.Width}x{sceneColorTexture.Height} {sceneColorTexture.Format} | ClearColorFallback: {m_ClearColor}");
+            ArisenEngine.Core.Diagnostics.Logger.Log($"[GenericRenderPipeline] SetupGraph | Frame: {context.FrameIndex} | Surface: 0x{context.SurfaceId:X} | Cameras: {context.CameraCount} | DirectionalLights: {context.DirectionalLightCount} | PointLights: {context.PointLightCount} | SpotLights: {context.SpotLightCount} | Environments: {context.SceneEnvironmentCount} | EnvironmentTexture: {(environmentTexture is { IsValid: true } ? environmentTexture.Asset.Name : "ProceduralFallback")} | EnvironmentIBL: {(environmentLighting is { IsValid: true } ? $"Ready (irr={environmentLighting.IrradianceImageIndex}, spec={environmentLighting.PrefilteredSpecularImageIndex}, brdf={environmentLighting.BrdfIntegrationLutImageIndex})" : "Unavailable")} | Materials: {preparedMaterialCount}/{registeredMaterialCount} prepared | LegacyDraws: {context.DrawListCount} | SceneItems: {m_StaticMeshCullingStats.SourceItemCount} | VisibleItems: {m_StaticMeshCullingStats.VisibleItemCount} | CulledItems: {m_StaticMeshCullingStats.CulledItemCount} | VisibleDrawCommands: {visibleDrawCommandCount} | SceneColor: {sceneColorTexture.Width}x{sceneColorTexture.Height} {sceneColorTexture.Format} | ClearColorFallback: {m_ClearColor}");
         }
 
         Profiler.PlotValue("Render.MaterialCount", registeredMaterialCount);
@@ -120,6 +130,10 @@ public class GenericRenderPipeline : RenderPipeline
         Profiler.PlotValue("Render.PointLightCount", context.PointLightCount);
         Profiler.PlotValue("Render.SpotLightCount", context.SpotLightCount);
         Profiler.PlotValue("Render.EnvironmentCount", context.SceneEnvironmentCount);
+        Profiler.PlotValue("Render.EnvironmentTextureEnabled", environmentTexture is { IsValid: true } ? 1 : 0);
+        Profiler.PlotValue("Render.EnvironmentIBLEnabled", environmentLighting is { IsValid: true } ? 1 : 0);
+        Profiler.PlotValue("Render.EnvironmentSpecularMaxLod", environmentLighting?.PrefilteredSpecularMaxLod ?? 0.0f);
+        Profiler.PlotValue("Render.SceneExposure", sceneEnvironment.Exposure);
         Profiler.PlotValue("Render.VisibleDrawCommandCount", visibleDrawCommandCount);
         Profiler.PlotValue("Render.SceneColor.Width", sceneColorTexture.Width);
         Profiler.PlotValue("Render.SceneColor.Height", sceneColorTexture.Height);
@@ -166,6 +180,10 @@ public class GenericRenderPipeline : RenderPipeline
         m_TonemapPass.Dispose();
         m_MaterialLibrary.ReleasePreparedResources();
         ReleaseSceneMeshes(disposeImmediately: true);
+        m_EnvironmentLighting?.Dispose();
+        m_EnvironmentLighting = null;
+        m_EnvironmentTexture?.Dispose();
+        m_EnvironmentTexture = null;
         m_DirectionalShadowTarget?.Dispose();
         m_DirectionalShadowTarget = null;
         m_FallbackMesh?.Dispose();
@@ -260,6 +278,19 @@ public class GenericRenderPipeline : RenderPipeline
     private void ApplyAssetInvalidations(ReadOnlySpan<Guid> dirtyGuids)
     {
         m_MaterialLibrary.InvalidateByAssetGuids(dirtyGuids, m_LastSubmittedTicket);
+        m_FailedEnvironmentTextureGuid = Guid.Empty;
+        m_FailedEnvironmentTextureStamp = AssetDependencyStamp.Empty;
+        m_FailedEnvironmentLightingGuid = Guid.Empty;
+        m_FailedEnvironmentLightingStamp = AssetDependencyStamp.Empty;
+
+        if (m_EnvironmentTexture is { IsValid: true } environmentTexture &&
+            (ContainsGuid(dirtyGuids, environmentTexture.Asset.Guid) ||
+             ContainsGuid(dirtyGuids, environmentTexture.Asset.SourceTexture.Guid)))
+        {
+            ArisenEngine.Core.Diagnostics.Logger.Log(
+                $"[GenericRenderPipeline] Asset change invalidated environment texture {environmentTexture.Asset.Guid}; releasing GPU texture.");
+            ReleaseEnvironmentTexture();
+        }
 
         if (m_FallbackMesh is { IsValid: true } &&
             ContainsGuid(dirtyGuids, GenericRenderPipelineAssetRefs.FacetedCrystalMesh.Ref.Guid))
@@ -277,6 +308,142 @@ public class GenericRenderPipeline : RenderPipeline
                 m_DisposalQueue.Enqueue(mesh, m_LastSubmittedTicket);
             }
         }
+    }
+
+    private RHIEnvironmentTextureResource? EnsureEnvironmentTexture(
+        RenderContext context,
+        SceneEnvironment environment)
+    {
+        var desiredGuid = environment.EnvironmentTextureGuid;
+        if (desiredGuid == Guid.Empty)
+        {
+            ReleaseEnvironmentTexture();
+            m_FailedEnvironmentTextureGuid = Guid.Empty;
+            m_FailedEnvironmentTextureStamp = AssetDependencyStamp.Empty;
+            return null;
+        }
+
+        if (m_EnvironmentTexture is { IsValid: true } current)
+        {
+            if (current.Asset.Guid == desiredGuid && !current.IsSourceStale())
+            {
+                return current;
+            }
+
+            ReleaseEnvironmentTexture();
+        }
+
+        EnvironmentTextureAsset? asset = null;
+        var dependencyStamp = AssetDependencyTracker.GetAssetStamp(m_AssetDatabase, desiredGuid);
+        try
+        {
+            asset = EnvironmentTextureAssetLoader.LoadSource(m_AssetDatabase, desiredGuid);
+            dependencyStamp = AssetDependencyTracker.GetEnvironmentTextureStamp(m_AssetDatabase, asset);
+            if (m_FailedEnvironmentTextureGuid == desiredGuid &&
+                m_FailedEnvironmentTextureStamp == dependencyStamp)
+            {
+                return null;
+            }
+
+            m_EnvironmentTexture = new RHIEnvironmentTextureResource(
+                context.Device,
+                m_AssetDatabase,
+                asset);
+            m_FailedEnvironmentTextureGuid = Guid.Empty;
+            m_FailedEnvironmentTextureStamp = AssetDependencyStamp.Empty;
+            return m_EnvironmentTexture;
+        }
+        catch (Exception ex)
+        {
+            if (m_FailedEnvironmentTextureGuid != desiredGuid ||
+                m_FailedEnvironmentTextureStamp != dependencyStamp)
+            {
+                ArisenEngine.Core.Diagnostics.Logger.Warning(
+                    $"[GenericRenderPipeline] Environment texture '{desiredGuid}' could not be prepared; using procedural sky fallback. {ex.Message}");
+            }
+
+            m_FailedEnvironmentTextureGuid = desiredGuid;
+            m_FailedEnvironmentTextureStamp = dependencyStamp;
+            return null;
+        }
+    }
+
+    private void ReleaseEnvironmentTexture()
+    {
+        ReleaseEnvironmentLighting();
+        if (m_EnvironmentTexture == null)
+        {
+            return;
+        }
+
+        m_DisposalQueue.Enqueue(m_EnvironmentTexture, m_LastSubmittedTicket);
+        m_EnvironmentTexture = null;
+    }
+
+    private RHIEnvironmentLightingResource? EnsureEnvironmentLighting(
+        RenderContext context,
+        RHIEnvironmentTextureResource? environmentTexture)
+    {
+        if (environmentTexture is not { IsValid: true })
+        {
+            ReleaseEnvironmentLighting();
+            m_FailedEnvironmentLightingGuid = Guid.Empty;
+            m_FailedEnvironmentLightingStamp = AssetDependencyStamp.Empty;
+            return null;
+        }
+
+        var asset = environmentTexture.Asset;
+        if (m_EnvironmentLighting is { IsValid: true } current)
+        {
+            if (current.Asset.Guid == asset.Guid && !current.IsSourceStale())
+            {
+                return current;
+            }
+
+            ReleaseEnvironmentLighting();
+        }
+
+        var dependencyStamp = environmentTexture.DependencyStamp;
+        if (m_FailedEnvironmentLightingGuid == asset.Guid &&
+            m_FailedEnvironmentLightingStamp == dependencyStamp)
+        {
+            return null;
+        }
+
+        try
+        {
+            m_EnvironmentLighting = new RHIEnvironmentLightingResource(
+                context.Device,
+                m_AssetDatabase,
+                asset);
+            m_FailedEnvironmentLightingGuid = Guid.Empty;
+            m_FailedEnvironmentLightingStamp = AssetDependencyStamp.Empty;
+            return m_EnvironmentLighting;
+        }
+        catch (Exception ex)
+        {
+            if (m_FailedEnvironmentLightingGuid != asset.Guid ||
+                m_FailedEnvironmentLightingStamp != dependencyStamp)
+            {
+                ArisenEngine.Core.Diagnostics.Logger.Warning(
+                    $"[GenericRenderPipeline] Environment IBL for '{asset.Guid}' could not be prepared; retaining the authored sky with ambient fallback. {ex.Message}");
+            }
+
+            m_FailedEnvironmentLightingGuid = asset.Guid;
+            m_FailedEnvironmentLightingStamp = dependencyStamp;
+            return null;
+        }
+    }
+
+    private void ReleaseEnvironmentLighting()
+    {
+        if (m_EnvironmentLighting == null)
+        {
+            return;
+        }
+
+        m_DisposalQueue.Enqueue(m_EnvironmentLighting, m_LastSubmittedTicket);
+        m_EnvironmentLighting = null;
     }
 
     private void RegisterSceneMaterials(ReadOnlySpan<StaticMeshRenderItem> items)

@@ -10,6 +10,7 @@ namespace ArisenEngine.Rendering;
 
 public sealed class EnvironmentSkyPass : RenderPassNode, IDisposable
 {
+    private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
     private const ulong DynamicViewportScissorMask = 0x1UL | 0x2UL;
     private const string VertexStage = "Vertex";
     private const string FragmentStage = "Fragment";
@@ -29,6 +30,10 @@ public sealed class EnvironmentSkyPass : RenderPassNode, IDisposable
     private EFormat m_ColorFormat = EFormat.FORMAT_UNDEFINED;
     private SceneEnvironment m_Environment = SceneEnvironment.Default;
     private EnvironmentSkyConstants m_Constants = EnvironmentSkyConstants.Default;
+    private uint m_EnvironmentImageIndex = InvalidBindlessIndex;
+    private uint m_EnvironmentSamplerIndex = InvalidBindlessIndex;
+    private float m_EnvironmentRotationRadians;
+    private float m_EnvironmentTextureIntensity;
     private bool m_Disposed;
 
     public EnvironmentSkyPass(
@@ -50,7 +55,23 @@ public sealed class EnvironmentSkyPass : RenderPassNode, IDisposable
     public void SetEnvironment(SceneEnvironment environment)
     {
         m_Environment = environment.IsValid ? environment : SceneEnvironment.Default;
-        m_Constants = EnvironmentSkyConstants.From(m_Environment, encodeOutputToSrgb: false);
+    }
+
+    public void SetEnvironmentTexture(RHIEnvironmentTextureResource? environmentTexture)
+    {
+        if (environmentTexture is { IsValid: true })
+        {
+            m_EnvironmentImageIndex = environmentTexture.BindlessImageIndex;
+            m_EnvironmentSamplerIndex = environmentTexture.BindlessSamplerIndex;
+            m_EnvironmentRotationRadians = environmentTexture.RotationRadians;
+            m_EnvironmentTextureIntensity = environmentTexture.Intensity;
+            return;
+        }
+
+        m_EnvironmentImageIndex = InvalidBindlessIndex;
+        m_EnvironmentSamplerIndex = InvalidBindlessIndex;
+        m_EnvironmentRotationRadians = 0.0f;
+        m_EnvironmentTextureIntensity = 0.0f;
     }
 
     public void SetColorTarget(
@@ -69,7 +90,13 @@ public sealed class EnvironmentSkyPass : RenderPassNode, IDisposable
         var colorFormat = m_TargetColorFormat != EFormat.FORMAT_UNDEFINED
             ? m_TargetColorFormat
             : factory.GetImageViewFormat(context.SwapChain.GetImageView(context.FrameIndex));
-        m_Constants = EnvironmentSkyConstants.From(m_Environment, encodeOutputToSrgb: false);
+        m_Constants = EnvironmentSkyConstants.From(
+            m_Environment,
+            m_EnvironmentImageIndex,
+            m_EnvironmentSamplerIndex,
+            m_EnvironmentRotationRadians,
+            m_EnvironmentTextureIntensity,
+            context);
         var shaderStamp = AssetDependencyTracker.GetShaderStamp(m_AssetDatabase, m_Shader);
         if (m_Pipeline.IsValid &&
             m_ColorFormat == colorFormat &&
@@ -276,31 +303,102 @@ public sealed class EnvironmentSkyPass : RenderPassNode, IDisposable
 [StructLayout(LayoutKind.Sequential)]
 internal readonly struct EnvironmentSkyConstants
 {
-    public static EnvironmentSkyConstants Default => From(SceneEnvironment.Default, false);
+    private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
+
+    public static EnvironmentSkyConstants Default => new(
+        new Vector4(SceneEnvironment.Default.SkyColor, SceneEnvironment.Default.SkyIntensity),
+        new Vector4(SceneEnvironment.Default.HorizonColor, 0.0f),
+        new Vector4(SceneEnvironment.Default.GroundColor, 0.0f),
+        new Vector4(Vector3.UnitX, MathF.Tan(MathF.PI / 6.0f)),
+        new Vector4(Vector3.UnitY, 16.0f / 9.0f),
+        new Vector4(Vector3.UnitZ, 0.0f),
+        InvalidBindlessIndex,
+        InvalidBindlessIndex,
+        0.0f,
+        0.0f);
 
     public readonly Vector4 SkyColorIntensity;
     public readonly Vector4 HorizonColor;
     public readonly Vector4 GroundColor;
-    public readonly Vector4 OutputEncoding;
+    public readonly Vector4 CameraRightTanHalfFov;
+    public readonly Vector4 CameraUpAspect;
+    public readonly Vector4 CameraForward;
+    public readonly uint EnvironmentImageIndex;
+    public readonly uint EnvironmentSamplerIndex;
+    public readonly float EnvironmentRotationRadians;
+    public readonly float EnvironmentTextureIntensity;
 
     private EnvironmentSkyConstants(
         Vector4 skyColorIntensity,
         Vector4 horizonColor,
         Vector4 groundColor,
-        Vector4 outputEncoding)
+        Vector4 cameraRightTanHalfFov,
+        Vector4 cameraUpAspect,
+        Vector4 cameraForward,
+        uint environmentImageIndex,
+        uint environmentSamplerIndex,
+        float environmentRotationRadians,
+        float environmentTextureIntensity)
     {
         SkyColorIntensity = skyColorIntensity;
         HorizonColor = horizonColor;
         GroundColor = groundColor;
-        OutputEncoding = outputEncoding;
+        CameraRightTanHalfFov = cameraRightTanHalfFov;
+        CameraUpAspect = cameraUpAspect;
+        CameraForward = cameraForward;
+        EnvironmentImageIndex = environmentImageIndex;
+        EnvironmentSamplerIndex = environmentSamplerIndex;
+        EnvironmentRotationRadians = environmentRotationRadians;
+        EnvironmentTextureIntensity = environmentTextureIntensity;
     }
 
-    public static EnvironmentSkyConstants From(SceneEnvironment environment, bool encodeOutputToSrgb)
+    public static EnvironmentSkyConstants From(
+        SceneEnvironment environment,
+        uint environmentImageIndex,
+        uint environmentSamplerIndex,
+        float environmentRotationRadians,
+        float environmentTextureIntensity,
+        RenderContext context)
     {
+        var right = Vector3.UnitX;
+        var up = Vector3.UnitY;
+        var forward = Vector3.UnitZ;
+        var verticalFovDegrees = 60.0f;
+        var aspectRatio = context.Height > 0
+            ? context.Width / (float)context.Height
+            : 1.0f;
+
+        if (context.CameraCount > 0)
+        {
+            ref readonly var camera = ref context.Cameras[0];
+            var rotation = Matrix4x4.CreateFromYawPitchRoll(
+                camera.Rotation.Y * (MathF.PI / 180.0f),
+                camera.Rotation.X * (MathF.PI / 180.0f),
+                camera.Rotation.Z * (MathF.PI / 180.0f));
+            right = Vector3.Normalize(Vector3.Transform(Vector3.UnitX, rotation));
+            up = Vector3.Normalize(Vector3.Transform(Vector3.UnitY, rotation));
+            forward = Vector3.Normalize(Vector3.Transform(Vector3.UnitZ, rotation));
+            verticalFovDegrees = camera.FieldOfView > 0.0f
+                ? camera.FieldOfView
+                : verticalFovDegrees;
+            aspectRatio = camera.AspectRatio > 0.0f
+                ? camera.AspectRatio
+                : aspectRatio;
+        }
+
+        var tanHalfFov = MathF.Tan(
+            Math.Clamp(verticalFovDegrees, 1.0f, 179.0f) *
+            (MathF.PI / 360.0f));
         return new EnvironmentSkyConstants(
             new Vector4(environment.SkyColor, environment.SkyIntensity),
             new Vector4(environment.HorizonColor, 0.0f),
             new Vector4(environment.GroundColor, 0.0f),
-            new Vector4(encodeOutputToSrgb ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f));
+            new Vector4(right, tanHalfFov),
+            new Vector4(up, aspectRatio),
+            new Vector4(forward, 0.0f),
+            environmentImageIndex,
+            environmentSamplerIndex,
+            environmentRotationRadians,
+            MathF.Max(0.0f, environmentTextureIntensity));
     }
 }

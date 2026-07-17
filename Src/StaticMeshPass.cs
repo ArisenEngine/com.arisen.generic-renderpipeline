@@ -31,6 +31,8 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     private SceneEnvironment m_SceneEnvironment = SceneEnvironment.Default;
     private StaticMeshLightingConstants m_LightingConstants = StaticMeshLightingConstants.Default;
     private StaticMeshShadowConstants m_ShadowConstants = StaticMeshShadowConstants.Disabled;
+    private StaticMeshEnvironmentLightingConstants m_EnvironmentLightingConstants =
+        StaticMeshEnvironmentLightingConstants.Disabled;
     private StaticMeshMaterialConstants m_FallbackMaterialConstants = StaticMeshMaterialConstants.Default;
     private StaticMeshMaterialSlot[] m_MaterialSlots = Array.Empty<StaticMeshMaterialSlot>();
     private StaticMeshPipelineBatch[] m_PipelineBatches = Array.Empty<StaticMeshPipelineBatch>();
@@ -894,6 +896,12 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         RefreshFallbackDrawConstants();
     }
 
+    public void SetEnvironmentLighting(RHIEnvironmentLightingResource? environmentLighting)
+    {
+        m_EnvironmentLightingConstants =
+            StaticMeshEnvironmentLightingConstants.From(environmentLighting);
+    }
+
     public void SetDirectionalShadow(
         Matrix4x4 shadowViewProjection,
         uint shadowImageIndex,
@@ -1040,7 +1048,11 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
                     m_ShadowViewProjection,
                     m_ShadowConstants,
                     materialConstants.EmissiveFactor,
-                    materialConstants.EmissiveTextureIndices);
+                    materialConstants.EmissiveTextureIndices,
+                    materialConstants.MetallicRoughnessTextureIndices,
+                    materialConstants.OcclusionTextureIndices,
+                    materialConstants.PbrMaterialParameters,
+                    m_EnvironmentLightingConstants);
             }
         }
         else
@@ -1051,7 +1063,11 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
                 m_ShadowViewProjection,
                 m_ShadowConstants,
                 m_FallbackMaterialConstants.EmissiveFactor,
-                m_FallbackMaterialConstants.EmissiveTextureIndices);
+                m_FallbackMaterialConstants.EmissiveTextureIndices,
+                m_FallbackMaterialConstants.MetallicRoughnessTextureIndices,
+                m_FallbackMaterialConstants.OcclusionTextureIndices,
+                m_FallbackMaterialConstants.PbrMaterialParameters,
+                m_EnvironmentLightingConstants);
         }
 
         for (int i = 0; i < pointLightCount; i++)
@@ -1320,11 +1336,23 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             ? normalConstants
             : baseColorTexture;
         var hasEmissiveTexture = material.TryGetTexture2DConstants(MaterialTextureSlots.Emissive, out var emissiveTexture);
+        var hasMetallicRoughnessTexture = material.TryGetTexture2DConstants(
+            MaterialTextureSlots.MetallicRoughness,
+            out var metallicRoughnessTexture);
+        var hasOcclusionTexture = material.TryGetTexture2DConstants(
+            MaterialTextureSlots.Occlusion,
+            out var occlusionTexture);
         var baseColorFactor = material.GetVector4PropertyOrDefault(
             MaterialPropertySlots.BaseColorFactor,
             Vector4.One);
         var metallicFactor = material.GetScalarPropertyOrDefault(MaterialPropertySlots.MetallicFactor, 0.0f);
         var roughnessFactor = material.GetScalarPropertyOrDefault(MaterialPropertySlots.RoughnessFactor, 1.0f);
+        var occlusionStrength = material.GetScalarPropertyOrDefault(
+            MaterialPropertySlots.OcclusionStrength,
+            MaterialPbrDefaults.OcclusionStrength);
+        var alphaCutoff = material.GetScalarPropertyOrDefault(
+            MaterialPropertySlots.AlphaCutoff,
+            MaterialPbrDefaults.AlphaCutoff);
         var emissiveFactor = material.GetVector4PropertyOrDefault(
             MaterialPropertySlots.EmissiveFactor,
             Vector4.Zero);
@@ -1334,13 +1362,21 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             emissiveFactor,
             metallicFactor,
             roughnessFactor,
+            occlusionStrength,
+            alphaCutoff,
             baseColorTexture.ImageIndex,
             baseColorTexture.SamplerIndex,
             normalTexture.ImageIndex,
             normalTexture.SamplerIndex,
             hasEmissiveTexture ? emissiveTexture.ImageIndex : 0,
             hasEmissiveTexture ? emissiveTexture.SamplerIndex : 0,
-            hasEmissiveTexture ? 1u : 0u);
+            hasEmissiveTexture ? 1u : 0u,
+            hasMetallicRoughnessTexture ? metallicRoughnessTexture.ImageIndex : 0,
+            hasMetallicRoughnessTexture ? metallicRoughnessTexture.SamplerIndex : 0,
+            hasMetallicRoughnessTexture ? 1u : 0u,
+            hasOcclusionTexture ? occlusionTexture.ImageIndex : 0,
+            hasOcclusionTexture ? occlusionTexture.SamplerIndex : 0,
+            hasOcclusionTexture ? 1u : 0u);
     }
 
     private StaticMeshMaterialConstants GetMaterialConstants(uint materialId)
@@ -1648,12 +1684,25 @@ internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
 [StructLayout(LayoutKind.Sequential)]
 internal readonly struct StaticMeshMaterialConstants : IEquatable<StaticMeshMaterialConstants>
 {
-    public static StaticMeshMaterialConstants Default => new(Vector4.One, Vector4.Zero, 0.0f, 1.0f, 0, 0, 0, 0, 0, 0, 0);
+    public static StaticMeshMaterialConstants Default => new(
+        Vector4.One,
+        Vector4.Zero,
+        0.0f,
+        1.0f,
+        MaterialPbrDefaults.OcclusionStrength,
+        MaterialPbrDefaults.AlphaCutoff,
+        0, 0,
+        0, 0,
+        0, 0, 0,
+        0, 0, 0,
+        0, 0, 0);
 
     public readonly Vector4 BaseColorFactor;
     public readonly Vector4 EmissiveFactor;
     public readonly float MetallicFactor;
     public readonly float RoughnessFactor;
+    public readonly float OcclusionStrength;
+    public readonly float AlphaCutoff;
     public readonly uint BaseColorImageIndex;
     public readonly uint BaseColorSamplerIndex;
     public readonly uint NormalImageIndex;
@@ -1661,25 +1710,52 @@ internal readonly struct StaticMeshMaterialConstants : IEquatable<StaticMeshMate
     public readonly uint EmissiveImageIndex;
     public readonly uint EmissiveSamplerIndex;
     public readonly uint HasEmissiveTexture;
+    public readonly uint MetallicRoughnessImageIndex;
+    public readonly uint MetallicRoughnessSamplerIndex;
+    public readonly uint HasMetallicRoughnessTexture;
+    public readonly uint OcclusionImageIndex;
+    public readonly uint OcclusionSamplerIndex;
+    public readonly uint HasOcclusionTexture;
     public Vector4 EmissiveTextureIndices => new(EmissiveImageIndex, EmissiveSamplerIndex, HasEmissiveTexture, 0.0f);
+    public Vector4 MetallicRoughnessTextureIndices => new(
+        MetallicRoughnessImageIndex,
+        MetallicRoughnessSamplerIndex,
+        HasMetallicRoughnessTexture,
+        0.0f);
+    public Vector4 OcclusionTextureIndices => new(
+        OcclusionImageIndex,
+        OcclusionSamplerIndex,
+        HasOcclusionTexture,
+        0.0f);
+    public Vector4 PbrMaterialParameters => new(OcclusionStrength, AlphaCutoff, 0.0f, 0.0f);
 
     public StaticMeshMaterialConstants(
         Vector4 baseColorFactor,
         Vector4 emissiveFactor,
         float metallicFactor,
         float roughnessFactor,
+        float occlusionStrength,
+        float alphaCutoff,
         uint baseColorImageIndex,
         uint baseColorSamplerIndex,
         uint normalImageIndex,
         uint normalSamplerIndex,
         uint emissiveImageIndex,
         uint emissiveSamplerIndex,
-        uint hasEmissiveTexture)
+        uint hasEmissiveTexture,
+        uint metallicRoughnessImageIndex,
+        uint metallicRoughnessSamplerIndex,
+        uint hasMetallicRoughnessTexture,
+        uint occlusionImageIndex,
+        uint occlusionSamplerIndex,
+        uint hasOcclusionTexture)
     {
         BaseColorFactor = baseColorFactor;
         EmissiveFactor = emissiveFactor;
         MetallicFactor = metallicFactor;
         RoughnessFactor = roughnessFactor;
+        OcclusionStrength = occlusionStrength;
+        AlphaCutoff = alphaCutoff;
         BaseColorImageIndex = baseColorImageIndex;
         BaseColorSamplerIndex = baseColorSamplerIndex;
         NormalImageIndex = normalImageIndex;
@@ -1687,6 +1763,12 @@ internal readonly struct StaticMeshMaterialConstants : IEquatable<StaticMeshMate
         EmissiveImageIndex = emissiveImageIndex;
         EmissiveSamplerIndex = emissiveSamplerIndex;
         HasEmissiveTexture = hasEmissiveTexture;
+        MetallicRoughnessImageIndex = metallicRoughnessImageIndex;
+        MetallicRoughnessSamplerIndex = metallicRoughnessSamplerIndex;
+        HasMetallicRoughnessTexture = hasMetallicRoughnessTexture;
+        OcclusionImageIndex = occlusionImageIndex;
+        OcclusionSamplerIndex = occlusionSamplerIndex;
+        HasOcclusionTexture = hasOcclusionTexture;
     }
 
     public bool Equals(StaticMeshMaterialConstants other)
@@ -1695,13 +1777,21 @@ internal readonly struct StaticMeshMaterialConstants : IEquatable<StaticMeshMate
                EmissiveFactor.Equals(other.EmissiveFactor) &&
                MetallicFactor.Equals(other.MetallicFactor) &&
                RoughnessFactor.Equals(other.RoughnessFactor) &&
+               OcclusionStrength.Equals(other.OcclusionStrength) &&
+               AlphaCutoff.Equals(other.AlphaCutoff) &&
                BaseColorImageIndex == other.BaseColorImageIndex &&
                BaseColorSamplerIndex == other.BaseColorSamplerIndex &&
                NormalImageIndex == other.NormalImageIndex &&
                NormalSamplerIndex == other.NormalSamplerIndex &&
                EmissiveImageIndex == other.EmissiveImageIndex &&
                EmissiveSamplerIndex == other.EmissiveSamplerIndex &&
-               HasEmissiveTexture == other.HasEmissiveTexture;
+               HasEmissiveTexture == other.HasEmissiveTexture &&
+               MetallicRoughnessImageIndex == other.MetallicRoughnessImageIndex &&
+               MetallicRoughnessSamplerIndex == other.MetallicRoughnessSamplerIndex &&
+               HasMetallicRoughnessTexture == other.HasMetallicRoughnessTexture &&
+               OcclusionImageIndex == other.OcclusionImageIndex &&
+               OcclusionSamplerIndex == other.OcclusionSamplerIndex &&
+               HasOcclusionTexture == other.HasOcclusionTexture;
     }
 
     public override bool Equals(object? obj)
@@ -1716,6 +1806,8 @@ internal readonly struct StaticMeshMaterialConstants : IEquatable<StaticMeshMate
         hash.Add(EmissiveFactor);
         hash.Add(MetallicFactor);
         hash.Add(RoughnessFactor);
+        hash.Add(OcclusionStrength);
+        hash.Add(AlphaCutoff);
         hash.Add(BaseColorImageIndex);
         hash.Add(BaseColorSamplerIndex);
         hash.Add(NormalImageIndex);
@@ -1723,6 +1815,12 @@ internal readonly struct StaticMeshMaterialConstants : IEquatable<StaticMeshMate
         hash.Add(EmissiveImageIndex);
         hash.Add(EmissiveSamplerIndex);
         hash.Add(HasEmissiveTexture);
+        hash.Add(MetallicRoughnessImageIndex);
+        hash.Add(MetallicRoughnessSamplerIndex);
+        hash.Add(HasMetallicRoughnessTexture);
+        hash.Add(OcclusionImageIndex);
+        hash.Add(OcclusionSamplerIndex);
+        hash.Add(HasOcclusionTexture);
         return hash.ToHashCode();
     }
 }
@@ -1766,6 +1864,67 @@ internal readonly struct StaticMeshLightingConstants
             new Vector4(light.Direction, light.Intensity),
             new Vector4(light.Color, light.AmbientIntensity),
             new Vector4(environment.AmbientColor, environment.AmbientIntensity));
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal readonly struct StaticMeshEnvironmentLightingConstants
+{
+    private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
+
+    public static StaticMeshEnvironmentLightingConstants Disabled => new(
+        new Vector4(
+            InvalidBindlessIndex,
+            InvalidBindlessIndex,
+            InvalidBindlessIndex,
+            InvalidBindlessIndex),
+        new Vector4(InvalidBindlessIndex, InvalidBindlessIndex, 0.0f, 0.0f),
+        Vector4.Zero);
+
+    public readonly Vector4 TextureIndices0;
+    public readonly Vector4 TextureIndices1;
+    public readonly Vector4 Parameters;
+
+    private StaticMeshEnvironmentLightingConstants(
+        Vector4 textureIndices0,
+        Vector4 textureIndices1,
+        Vector4 parameters)
+    {
+        TextureIndices0 = textureIndices0;
+        TextureIndices1 = textureIndices1;
+        Parameters = parameters;
+    }
+
+    public static StaticMeshEnvironmentLightingConstants From(
+        RHIEnvironmentLightingResource? environmentLighting)
+    {
+        if (environmentLighting is not { IsValid: true } ||
+            environmentLighting.IrradianceImageIndex == InvalidBindlessIndex ||
+            environmentLighting.IrradianceSamplerIndex == InvalidBindlessIndex ||
+            environmentLighting.PrefilteredSpecularImageIndex == InvalidBindlessIndex ||
+            environmentLighting.PrefilteredSpecularSamplerIndex == InvalidBindlessIndex ||
+            environmentLighting.BrdfIntegrationLutImageIndex == InvalidBindlessIndex ||
+            environmentLighting.BrdfIntegrationLutSamplerIndex == InvalidBindlessIndex)
+        {
+            return Disabled;
+        }
+
+        return new StaticMeshEnvironmentLightingConstants(
+            new Vector4(
+                environmentLighting.IrradianceImageIndex,
+                environmentLighting.IrradianceSamplerIndex,
+                environmentLighting.PrefilteredSpecularImageIndex,
+                environmentLighting.PrefilteredSpecularSamplerIndex),
+            new Vector4(
+                environmentLighting.BrdfIntegrationLutImageIndex,
+                environmentLighting.BrdfIntegrationLutSamplerIndex,
+                environmentLighting.PrefilteredSpecularMaxLod,
+                1.0f),
+            new Vector4(
+                environmentLighting.RotationRadians,
+                environmentLighting.Intensity,
+                0.0f,
+                0.0f));
     }
 }
 
@@ -1913,6 +2072,12 @@ internal readonly struct StaticMeshObjectData
     public readonly Vector4 ShadowParameters;
     public readonly Vector4 EmissiveFactor;
     public readonly Vector4 EmissiveTextureIndices;
+    public readonly Vector4 MetallicRoughnessTextureIndices;
+    public readonly Vector4 OcclusionTextureIndices;
+    public readonly Vector4 PbrMaterialParameters;
+    public readonly Vector4 EnvironmentTextureIndices0;
+    public readonly Vector4 EnvironmentTextureIndices1;
+    public readonly Vector4 EnvironmentParameters;
 
     private StaticMeshObjectData(
         Vector4 modelViewProjectionColumn0,
@@ -1929,7 +2094,11 @@ internal readonly struct StaticMeshObjectData
         Vector4 shadowTextureIndices,
         Vector4 shadowParameters,
         Vector4 emissiveFactor,
-        Vector4 emissiveTextureIndices)
+        Vector4 emissiveTextureIndices,
+        Vector4 metallicRoughnessTextureIndices,
+        Vector4 occlusionTextureIndices,
+        Vector4 pbrMaterialParameters,
+        StaticMeshEnvironmentLightingConstants environmentLightingConstants)
     {
         ModelViewProjectionColumn0 = modelViewProjectionColumn0;
         ModelViewProjectionColumn1 = modelViewProjectionColumn1;
@@ -1946,6 +2115,12 @@ internal readonly struct StaticMeshObjectData
         ShadowParameters = shadowParameters;
         EmissiveFactor = emissiveFactor;
         EmissiveTextureIndices = emissiveTextureIndices;
+        MetallicRoughnessTextureIndices = metallicRoughnessTextureIndices;
+        OcclusionTextureIndices = occlusionTextureIndices;
+        PbrMaterialParameters = pbrMaterialParameters;
+        EnvironmentTextureIndices0 = environmentLightingConstants.TextureIndices0;
+        EnvironmentTextureIndices1 = environmentLightingConstants.TextureIndices1;
+        EnvironmentParameters = environmentLightingConstants.Parameters;
     }
 
     public static StaticMeshObjectData From(
@@ -1954,7 +2129,11 @@ internal readonly struct StaticMeshObjectData
         Matrix4x4 shadowViewProjection,
         StaticMeshShadowConstants shadowConstants,
         Vector4 emissiveFactor,
-        Vector4 emissiveTextureIndices)
+        Vector4 emissiveTextureIndices,
+        Vector4 metallicRoughnessTextureIndices,
+        Vector4 occlusionTextureIndices,
+        Vector4 pbrMaterialParameters,
+        StaticMeshEnvironmentLightingConstants environmentLightingConstants)
     {
         var modelViewProjection = localToWorld * viewProjection;
         var shadowModelViewProjection = localToWorld * shadowViewProjection;
@@ -1973,7 +2152,11 @@ internal readonly struct StaticMeshObjectData
             shadowConstants.TextureIndices,
             shadowConstants.Parameters,
             emissiveFactor,
-            emissiveTextureIndices);
+            emissiveTextureIndices,
+            metallicRoughnessTextureIndices,
+            occlusionTextureIndices,
+            pbrMaterialParameters,
+            environmentLightingConstants);
     }
 
     public static StaticMeshObjectData From(PointLight light)
@@ -1993,7 +2176,11 @@ internal readonly struct StaticMeshObjectData
             Vector4.Zero,
             Vector4.Zero,
             Vector4.Zero,
-            Vector4.Zero);
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            StaticMeshEnvironmentLightingConstants.Disabled);
     }
 
     public static StaticMeshObjectData From(SpotLight light)
@@ -2013,6 +2200,10 @@ internal readonly struct StaticMeshObjectData
             Vector4.Zero,
             Vector4.Zero,
             Vector4.Zero,
-            Vector4.Zero);
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            Vector4.Zero,
+            StaticMeshEnvironmentLightingConstants.Disabled);
     }
 }

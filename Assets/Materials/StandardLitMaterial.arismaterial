@@ -36,6 +36,10 @@ ScalarProperties:
   Value: 0
 - Name: RoughnessFactor
   Value: 0.7
+- Name: OcclusionStrength
+  Value: 1
+- Name: AlphaCutoff
+  Value: 0.5
 Vector4Properties:
 - Name: BaseColorFactor
   Value:

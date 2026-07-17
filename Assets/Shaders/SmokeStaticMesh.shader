@@ -41,6 +41,14 @@ Shader "GenericRP/SmokeStaticMesh"
                 float4 shadowModelViewProjectionColumn3;
                 float4 shadowTextureIndices;
                 float4 shadowParameters;
+                float4 emissiveFactor;
+                float4 emissiveTextureIndices;
+                float4 metallicRoughnessTextureIndices;
+                float4 occlusionTextureIndices;
+                float4 pbrMaterialParameters;
+                float4 environmentTextureIndices0;
+                float4 environmentTextureIndices1;
+                float4 environmentParameters;
             };
 
             [[vk::binding(2, 3)]]
