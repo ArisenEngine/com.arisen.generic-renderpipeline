@@ -48,6 +48,12 @@ Shader "GenericRP/StandardLit"
                 float4 shadowParameters;
                 float4 emissiveFactor;
                 float4 emissiveTextureIndices;
+                float4 metallicRoughnessTextureIndices;
+                float4 occlusionTextureIndices;
+                float4 pbrMaterialParameters;
+                float4 environmentTextureIndices0;
+                float4 environmentTextureIndices1;
+                float4 environmentParameters;
             };
 
             [[vk::binding(2, 3)]]
@@ -97,6 +103,12 @@ Shader "GenericRP/StandardLit"
                 nointerpolation float4 ShadowParameters : TEXCOORD4;
                 nointerpolation float4 EmissiveFactor : TEXCOORD5;
                 nointerpolation float4 EmissiveTextureIndices : TEXCOORD6;
+                nointerpolation float4 MetallicRoughnessTextureIndices : TEXCOORD7;
+                nointerpolation float4 OcclusionTextureIndices : TEXCOORD8;
+                nointerpolation float4 PbrMaterialParameters : TEXCOORD9;
+                nointerpolation float4 EnvironmentTextureIndices0 : TEXCOORD10;
+                nointerpolation float4 EnvironmentTextureIndices1 : TEXCOORD11;
+                nointerpolation float4 EnvironmentParameters : TEXCOORD12;
             };
 
             static const float PI = 3.14159265359;
@@ -145,6 +157,12 @@ Shader "GenericRP/StandardLit"
                 output.ShadowParameters = objectData.shadowParameters;
                 output.EmissiveFactor = objectData.emissiveFactor;
                 output.EmissiveTextureIndices = objectData.emissiveTextureIndices;
+                output.MetallicRoughnessTextureIndices = objectData.metallicRoughnessTextureIndices;
+                output.OcclusionTextureIndices = objectData.occlusionTextureIndices;
+                output.PbrMaterialParameters = objectData.pbrMaterialParameters;
+                output.EnvironmentTextureIndices0 = objectData.environmentTextureIndices0;
+                output.EnvironmentTextureIndices1 = objectData.environmentTextureIndices1;
+                output.EnvironmentParameters = objectData.environmentParameters;
                 return output;
             }
 
@@ -232,6 +250,27 @@ Shader "GenericRP/StandardLit"
                     (1.0 - reflectanceAtNormal) * pow(saturate(1.0 - cosine), 5.0);
             }
 
+            float3 FresnelSchlickRoughness(
+                float cosine,
+                float3 reflectanceAtNormal,
+                float roughness)
+            {
+                float3 grazingReflectance = max(
+                    float3(1.0 - roughness, 1.0 - roughness, 1.0 - roughness),
+                    reflectanceAtNormal);
+                return reflectanceAtNormal +
+                    (grazingReflectance - reflectanceAtNormal) *
+                    pow(saturate(1.0 - cosine), 5.0);
+            }
+
+            float2 DirectionToLatLongUV(float3 direction, float rotationRadians)
+            {
+                float longitude = atan2(direction.x, direction.z) + rotationRadians;
+                return float2(
+                    frac(0.5 + longitude * (1.0 / 6.28318530718)),
+                    acos(clamp(direction.y, -1.0, 1.0)) * (1.0 / PI));
+            }
+
             float3 EvaluatePbrDirectLight(
                 float3 normal,
                 float3 viewDirection,
@@ -315,13 +354,58 @@ Shader "GenericRP/StandardLit"
                 return emissive;
             }
 
+            void ResolvePbrSurface(
+                VSOutput input,
+                out float metallic,
+                out float roughness,
+                out float occlusion)
+            {
+                metallic = saturate(DrawConstants.metallicFactor);
+                roughness = DrawConstants.roughnessFactor;
+                occlusion = 1.0;
+
+                float4 packedMetallicRoughness = float4(1.0, 1.0, 1.0, 1.0);
+                bool hasMetallicRoughnessTexture = input.MetallicRoughnessTextureIndices.z > 0.5;
+                if (hasMetallicRoughnessTexture)
+                {
+                    uint imageIndex = (uint)input.MetallicRoughnessTextureIndices.x;
+                    uint samplerIndex = (uint)input.MetallicRoughnessTextureIndices.y;
+                    packedMetallicRoughness = BindlessImages[NonUniformResourceIndex(imageIndex)].Sample(
+                        BindlessSamplers[NonUniformResourceIndex(samplerIndex)],
+                        input.UV);
+                    roughness *= packedMetallicRoughness.g;
+                    metallic *= packedMetallicRoughness.b;
+                }
+
+                roughness = clamp(roughness, 0.08, 1.0);
+                metallic = saturate(metallic);
+
+                if (input.OcclusionTextureIndices.z > 0.5)
+                {
+                    uint imageIndex = (uint)input.OcclusionTextureIndices.x;
+                    uint samplerIndex = (uint)input.OcclusionTextureIndices.y;
+                    bool sharesPackedSample = hasMetallicRoughnessTexture &&
+                        imageIndex == (uint)input.MetallicRoughnessTextureIndices.x &&
+                        samplerIndex == (uint)input.MetallicRoughnessTextureIndices.y;
+                    float occlusionTexel = sharesPackedSample
+                        ? packedMetallicRoughness.r
+                        : BindlessImages[NonUniformResourceIndex(imageIndex)].Sample(
+                            BindlessSamplers[NonUniformResourceIndex(samplerIndex)],
+                            input.UV).r;
+                    occlusion = lerp(
+                        1.0,
+                        saturate(occlusionTexel),
+                        saturate(input.PbrMaterialParameters.x));
+                }
+            }
+
             float4 PSMain(VSOutput input) : SV_Target0
             {
                 float3 normal = ResolveNormal(input);
                 float4 baseColor = SampleBaseColor(input, normal) * DrawConstants.baseColorFactor;
 
 #if ALPHA_TEST
-                clip(baseColor.a - 0.5);
+                clip(baseColor.a - input.PbrMaterialParameters.y);
 #endif
 
                 float3 albedo = max(baseColor.rgb * input.Color, 0.0);
@@ -335,8 +419,10 @@ Shader "GenericRP/StandardLit"
                 float3 lightColor = max(DrawConstants.lightColorAmbient.rgb, 0.0);
                 float3 ambientColor = max(DrawConstants.environmentAmbient.rgb, 0.0);
                 float ambientIntensity = max(DrawConstants.environmentAmbient.w, 0.0);
-                float roughness = clamp(DrawConstants.roughnessFactor, 0.08, 1.0);
-                float metallic = saturate(DrawConstants.metallicFactor);
+                float metallic;
+                float roughness;
+                float occlusion;
+                ResolvePbrSurface(input, metallic, roughness, occlusion);
                 float3 reflectanceAtNormal = lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
 
                 float ndotl;
@@ -454,8 +540,60 @@ Shader "GenericRP/StandardLit"
                 float3 ambientSpecular = ambientRadiance * reflectanceAtNormal *
                     lerp(0.22, 0.08, roughness);
 
+                if (input.EnvironmentTextureIndices1.w > 0.5)
+                {
+                    uint irradianceImageIndex = (uint)input.EnvironmentTextureIndices0.x;
+                    uint irradianceSamplerIndex = (uint)input.EnvironmentTextureIndices0.y;
+                    uint specularImageIndex = (uint)input.EnvironmentTextureIndices0.z;
+                    uint specularSamplerIndex = (uint)input.EnvironmentTextureIndices0.w;
+                    uint brdfImageIndex = (uint)input.EnvironmentTextureIndices1.x;
+                    uint brdfSamplerIndex = (uint)input.EnvironmentTextureIndices1.y;
+                    float specularMaxLod = max(input.EnvironmentTextureIndices1.z, 0.0);
+                    float environmentRotation = input.EnvironmentParameters.x;
+                    float environmentIntensity = max(input.EnvironmentParameters.y, 0.0) *
+                        ambientIntensity;
+
+                    float2 irradianceUV = DirectionToLatLongUV(normal, environmentRotation);
+                    float3 irradiance = max(
+                        BindlessImages[NonUniformResourceIndex(irradianceImageIndex)].SampleLevel(
+                            BindlessSamplers[NonUniformResourceIndex(irradianceSamplerIndex)],
+                            irradianceUV,
+                            0.0).rgb,
+                        0.0);
+
+                    float3 reflectionDirection = SafeNormalize(
+                        reflect(-viewDirection, normal),
+                        normal);
+                    float2 specularUV = DirectionToLatLongUV(
+                        reflectionDirection,
+                        environmentRotation);
+                    float3 prefilteredSpecular = max(
+                        BindlessImages[NonUniformResourceIndex(specularImageIndex)].SampleLevel(
+                            BindlessSamplers[NonUniformResourceIndex(specularSamplerIndex)],
+                            specularUV,
+                            roughness * specularMaxLod).rgb,
+                        0.0);
+
+                    float normalDotView = saturate(dot(normal, viewDirection));
+                    float2 brdf = max(
+                        BindlessImages[NonUniformResourceIndex(brdfImageIndex)].SampleLevel(
+                            BindlessSamplers[NonUniformResourceIndex(brdfSamplerIndex)],
+                            float2(normalDotView, roughness),
+                            0.0).rg,
+                        0.0);
+                    float3 environmentFresnel = FresnelSchlickRoughness(
+                        normalDotView,
+                        reflectanceAtNormal,
+                        roughness);
+                    float3 diffuseWeight = (1.0 - environmentFresnel) * (1.0 - metallic);
+                    ambientDiffuse = irradiance * albedo * diffuseWeight * environmentIntensity;
+                    ambientSpecular = prefilteredSpecular *
+                        (reflectanceAtNormal * brdf.x + brdf.y) * environmentIntensity;
+                }
+
                 float3 emissive = ResolveEmissive(input);
-                float3 outputColor = directLighting + ambientDiffuse + ambientSpecular + emissive;
+                float3 indirectLighting = (ambientDiffuse + ambientSpecular) * occlusion;
+                float3 outputColor = directLighting + indirectLighting + emissive;
                 if (DrawConstants.encodeOutputToSrgb != 0)
                 {
                     outputColor = LinearToSRgb(outputColor);

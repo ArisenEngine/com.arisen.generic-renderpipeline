@@ -60,7 +60,7 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
 
     public void SetExposure(float exposure)
     {
-        m_Exposure = MathF.Max(0.0f, exposure);
+        m_Exposure = SceneEnvironment.NormalizeExposure(exposure);
     }
 
     public void Prepare(RenderContext context)
