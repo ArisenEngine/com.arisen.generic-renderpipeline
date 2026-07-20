@@ -314,27 +314,31 @@ Shader "GenericRP/StandardLit"
                 float2 shadowUV = float2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);
                 float receiverDepth = projected.z;
                 float baseBias = max(input.ShadowParameters.x, 0.0);
-                float bias = baseBias * lerp(1.8, 0.75, saturate(ndotl));
+                float slopeBias = max(input.ShadowTextureIndices.w, 0.0);
+                float bias = baseBias + slopeBias * (1.0 - saturate(ndotl));
                 float strength = saturate(input.ShadowParameters.y);
                 float texelSize = max(input.ShadowParameters.z, 0.00001);
+                int pcfRadius = clamp((int)(input.ShadowTextureIndices.z + 0.5), 0, 3);
 
                 Texture2D<float4> shadowMap = BindlessImages[NonUniformResourceIndex(shadowImageIndex)];
                 SamplerState shadowSampler = BindlessSamplers[NonUniformResourceIndex(shadowSamplerIndex)];
 
                 float visible = 0.0;
-                [unroll]
-                for (int y = -1; y <= 1; y++)
+                float sampleCount = 0.0;
+                [loop]
+                for (int y = -pcfRadius; y <= pcfRadius; y++)
                 {
-                    [unroll]
-                    for (int x = -1; x <= 1; x++)
+                    [loop]
+                    for (int x = -pcfRadius; x <= pcfRadius; x++)
                     {
                         float2 sampleUV = shadowUV + float2(x, y) * texelSize;
                         float sampledDepth = shadowMap.SampleLevel(shadowSampler, sampleUV, 0.0).r;
                         visible += receiverDepth - bias <= sampledDepth ? 1.0 : 0.0;
+                        sampleCount += 1.0;
                     }
                 }
 
-                visible *= 1.0 / 9.0;
+                visible /= max(sampleCount, 1.0);
                 return lerp(1.0 - strength, 1.0, visible);
             }
 

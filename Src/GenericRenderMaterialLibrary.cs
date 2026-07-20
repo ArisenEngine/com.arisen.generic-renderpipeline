@@ -139,6 +139,32 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
         throw new InvalidOperationException($"[GenericRenderMaterialLibrary] Material ID {materialId} is not registered.");
     }
 
+    public RenderQueueInfo GetRenderQueue(uint materialId)
+    {
+        ThrowIfDisposed();
+
+        if (materialId < FirstMaterialID)
+        {
+            return RenderQueueInfo.Opaque;
+        }
+
+        uint materialIndex = materialId - FirstMaterialID;
+        if (materialIndex >= (uint)m_Materials.Count)
+        {
+            return RenderQueueInfo.Opaque;
+        }
+
+        var entry = m_Materials[(int)materialIndex];
+        if (entry.MaterialID != materialId || entry.Resource is not { IsValid: true } resource)
+        {
+            return RenderQueueInfo.Opaque;
+        }
+
+        return RenderQueuePolicy.Resolve(
+            resource.RenderState,
+            resource.Asset.Shader.VariantKeywords);
+    }
+
     public void InvalidateByAssetGuids(ReadOnlySpan<Guid> dirtyGuids, ulong submittedTicket)
     {
         ThrowIfDisposed();

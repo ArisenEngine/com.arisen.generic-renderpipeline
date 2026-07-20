@@ -10,37 +10,32 @@ namespace ArisenEngine.Rendering;
 /// </summary>
 public class GenericRenderPipelinePackage : IPackageEntry
 {
-    private GenericRenderPipelineAsset? m_DefaultAsset;
+    private GenericRenderPipelineProvider? m_Provider;
     private GenericRenderMaterialLibrary? m_MaterialLibrary;
     private DeferredRenderResourceDisposalQueue? m_DisposalQueue;
 
     public void OnLoad(IServiceRegistry registry)
     {
-        KernelLog.Info("[GenericRP] Initializing default render pipeline asset...");
+        KernelLog.Info("[GenericRP] Registering render-pipeline provider...");
 
         var assetDatabase = registry.GetService<IAssetDatabase>();
         m_DisposalQueue = new DeferredRenderResourceDisposalQueue();
         m_MaterialLibrary = new GenericRenderMaterialLibrary(assetDatabase, m_DisposalQueue);
         m_MaterialLibrary.RegisterDefaultMaterial(GenericRenderPipelineAssetRefs.StandardLitMaterial.Ref);
         registry.RegisterService<IRenderMaterialLibrary>(m_MaterialLibrary);
+        m_Provider = new GenericRenderPipelineProvider(
+            assetDatabase,
+            m_MaterialLibrary,
+            m_DisposalQueue);
+        registry.RegisterService<IRenderPipelineProvider>(m_Provider);
 
-        // For development, we auto-instantiate the asset if one isn't already assigned.
-        // In the future, this will be loaded from the ProjectSettings asset via AssetDatabase.
-        m_DefaultAsset = new GenericRenderPipelineAsset(assetDatabase, m_MaterialLibrary, m_DisposalQueue);
-        
-        // This effectively "turns on" the rendering logic for the project.
-        Graphics.SetCurrentRenderPipeline(m_DefaultAsset);
-        
-        KernelLog.Info("[GenericRP] Default pipeline asset assigned to Graphics.");
+        KernelLog.Info("[GenericRP] Provider registered; project selection activates it during RenderSubsystem initialization.");
     }
 
     public void OnUnload(IServiceRegistry registry)
     {
-        if (Graphics.CurrentRenderPipelineAsset == m_DefaultAsset)
-        {
-            Graphics.SetCurrentRenderPipeline(null);
-        }
-        m_DefaultAsset = null;
+        m_Provider?.Deactivate();
+        m_Provider = null;
         m_MaterialLibrary?.Dispose();
         m_MaterialLibrary = null;
         m_DisposalQueue = null;
