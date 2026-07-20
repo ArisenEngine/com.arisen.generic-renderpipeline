@@ -12,12 +12,6 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
 {
     private const ulong DynamicViewportScissorMask = 0x1UL | 0x2UL;
     private const string VertexStage = "Vertex";
-    private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
-    private const float ShowcaseShadowDiameter = 10.0f;
-    private const float ShowcaseShadowCenterY = 0.75f;
-    private const float ShowcaseShadowEyeDistance = 11.0f;
-    private const float ShowcaseShadowDepth = 24.0f;
-
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly ShaderAsset m_Shader;
     private RHIFactory m_Factory;
@@ -26,9 +20,12 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
     private RHIShaderProgramHandle m_VertexProgram = RHIShaderProgramHandle.Invalid;
     private CookedAssetHandle m_VertexShaderAsset = CookedAssetHandle.Invalid;
     private AssetDependencyStamp m_ShaderStamp = AssetDependencyStamp.Empty;
-    private DirectionalShadowTarget? m_Target;
-    private EFormat m_DepthFormat = EFormat.FORMAT_UNDEFINED;
-    private DirectionalLight m_DirectionalLight = DirectionalLight.Default;
+    private RHIImageViewHandle m_DepthImageView = RHIImageViewHandle.Invalid;
+    private EFormat m_TargetDepthFormat = EFormat.FORMAT_UNDEFINED;
+    private uint m_TargetWidth;
+    private uint m_TargetHeight;
+    private EFormat m_PipelineDepthFormat = EFormat.FORMAT_UNDEFINED;
+    private DirectionalShadowProjection m_Projection;
     private Matrix4x4 m_ViewProjection = Matrix4x4.Identity;
     private MeshDrawCommand[] m_PreparedDraws = Array.Empty<MeshDrawCommand>();
     private ShadowDepthDrawConstants[] m_DrawConstants = Array.Empty<ShadowDepthDrawConstants>();
@@ -36,7 +33,16 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
     private bool m_Disposed;
 
     public Matrix4x4 ViewProjection => m_ViewProjection;
-    public bool HasRenderableShadowMap => m_Target is { IsValid: true } && m_PreparedDrawCount > 0;
+    public bool HasRenderableShadowMap =>
+        HasValidDepthTarget &&
+        m_Pipeline.IsValid &&
+        m_PreparedDrawCount > 0;
+
+    private bool HasValidDepthTarget =>
+        m_DepthImageView.IsValid &&
+        m_TargetDepthFormat != EFormat.FORMAT_UNDEFINED &&
+        m_TargetWidth > 0 &&
+        m_TargetHeight > 0;
 
     public DirectionalShadowPass(
         IAssetDatabase assetDatabase,
@@ -53,15 +59,42 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
             ShaderVariantKey.VulkanDebug);
     }
 
-    public void SetTarget(DirectionalShadowTarget target)
+    public void SetDepthTarget(
+        RHIImageViewHandle imageView,
+        EFormat depthFormat,
+        uint width,
+        uint height)
     {
-        m_Target = target ?? throw new ArgumentNullException(nameof(target));
+        if (!imageView.IsValid)
+        {
+            throw new ArgumentException("[DirectionalShadowPass] Depth image view is invalid.", nameof(imageView));
+        }
+
+        if (depthFormat == EFormat.FORMAT_UNDEFINED)
+        {
+            throw new ArgumentOutOfRangeException(nameof(depthFormat));
+        }
+
+        if (width == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(width), "[DirectionalShadowPass] Depth target width must be non-zero.");
+        }
+
+        if (height == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(height), "[DirectionalShadowPass] Depth target height must be non-zero.");
+        }
+
+        m_DepthImageView = imageView;
+        m_TargetDepthFormat = depthFormat;
+        m_TargetWidth = width;
+        m_TargetHeight = height;
     }
 
-    public void SetDirectionalLight(DirectionalLight light)
+    public void SetProjection(in DirectionalShadowProjection projection)
     {
-        m_DirectionalLight = light.IsValid ? light : DirectionalLight.Default;
-        m_ViewProjection = CreateShowcaseShadowViewProjection(m_DirectionalLight);
+        m_Projection = projection;
+        m_ViewProjection = projection.ViewProjection;
     }
 
     public void SetPreparedDraws(ReadOnlySpan<MeshDrawCommand> drawCommands)
@@ -81,27 +114,26 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
 
         ThrowIfDisposed();
 
-        var target = m_Target;
-        if (target is not { IsValid: true })
+        if (!HasValidDepthTarget)
         {
             return;
         }
 
         var factory = context.Device.GetFactory();
-        var depthFormat = target.Format;
+        var depthFormat = m_TargetDepthFormat;
         EnsureDrawConstants();
         var shaderStamp = AssetDependencyTracker.GetShaderStamp(m_AssetDatabase, m_Shader);
         if (m_Pipeline.IsValid &&
-            m_DepthFormat == depthFormat &&
+            m_PipelineDepthFormat == depthFormat &&
             m_ShaderStamp == shaderStamp)
         {
-            PlotDiagnostics(target);
+            PlotDiagnostics();
             return;
         }
 
         ReleasePipelineResources();
         m_Factory = factory;
-        m_DepthFormat = depthFormat;
+        m_PipelineDepthFormat = depthFormat;
 
         try
         {
@@ -139,7 +171,7 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
             m_ShaderStamp = shaderStamp;
             Logger.Log(
                 $"[DirectionalShadowPass] Prepared pipeline | DepthFormat: {depthFormat} | Pipeline: {m_Pipeline.Index}:{m_Pipeline.Generation}");
-            PlotDiagnostics(target);
+            PlotDiagnostics();
         }
         catch
         {
@@ -150,21 +182,14 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
 
     protected override void Record(RenderContext context, RenderCommandList commandList)
     {
-        var target = m_Target;
         if (!m_Pipeline.IsValid ||
-            target is not { IsValid: true } ||
-            m_PreparedDrawCount <= 0)
+            !HasValidDepthTarget)
         {
             return;
         }
 
-        commandList.TransitionImageLayout(
-            target.Image,
-            target.ExpectedLayout,
-            EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-
         commandList.BeginRenderingDepthOnly(
-            target.ImageView,
+            m_DepthImageView,
             EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             EAttachmentLoadOp.ATTACHMENT_LOAD_OP_CLEAR,
             EAttachmentStoreOp.ATTACHMENT_STORE_OP_STORE,
@@ -172,11 +197,11 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
             0,
             0,
             0,
-            target.Size,
-            target.Size);
+            m_TargetWidth,
+            m_TargetHeight);
         commandList.BindPipeline(m_Pipeline);
-        commandList.SetViewport(0, 0, target.Size, target.Size);
-        commandList.SetScissor(0, 0, target.Size, target.Size);
+        commandList.SetViewport(0, 0, m_TargetWidth, m_TargetHeight);
+        commandList.SetScissor(0, 0, m_TargetWidth, m_TargetHeight);
 
         int drawCount = m_PreparedDrawCount;
         for (int i = 0; i < drawCount; i++)
@@ -196,11 +221,6 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
         }
 
         commandList.EndRendering();
-        commandList.TransitionImageLayout(
-            target.Image,
-            EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
-        target.SetExpectedLayout(EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
     }
 
     public void Dispose()
@@ -211,6 +231,10 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
         }
 
         ReleasePipelineResources();
+        m_DepthImageView = RHIImageViewHandle.Invalid;
+        m_TargetDepthFormat = EFormat.FORMAT_UNDEFINED;
+        m_TargetWidth = 0;
+        m_TargetHeight = 0;
         m_Disposed = true;
     }
 
@@ -305,34 +329,19 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
         m_VertexProgram = RHIShaderProgramHandle.Invalid;
         m_VertexShaderAsset = CookedAssetHandle.Invalid;
         m_ShaderStamp = AssetDependencyStamp.Empty;
-        m_DepthFormat = EFormat.FORMAT_UNDEFINED;
+        m_PipelineDepthFormat = EFormat.FORMAT_UNDEFINED;
     }
 
-    private void PlotDiagnostics(DirectionalShadowTarget target)
+    private void PlotDiagnostics()
     {
         Profiler.PlotValue("DirectionalShadowPass.DrawCount", m_PreparedDrawCount);
-        Profiler.PlotValue("DirectionalShadowPass.ShadowMapSize", target.Size);
-        Profiler.PlotValue("DirectionalShadowPass.DepthFormat", (double)(uint)target.Format);
+        Profiler.PlotValue("DirectionalShadowPass.ShadowMapSize", m_TargetWidth);
+        Profiler.PlotValue("DirectionalShadowPass.DepthFormat", (double)(uint)m_TargetDepthFormat);
         Profiler.PlotValue("DirectionalShadowPass.Enabled", HasRenderableShadowMap ? 1 : 0);
-    }
-
-    private static Matrix4x4 CreateShowcaseShadowViewProjection(DirectionalLight light)
-    {
-        var lightDirection = light.IsValid
-            ? Vector3.Normalize(light.Direction)
-            : Vector3.Normalize(DirectionalLight.Default.Direction);
-        var center = new Vector3(0.0f, ShowcaseShadowCenterY, 0.0f);
-        var eye = center + lightDirection * ShowcaseShadowEyeDistance;
-        var up = MathF.Abs(Vector3.Dot(lightDirection, Vector3.UnitY)) > 0.92f
-            ? Vector3.UnitZ
-            : Vector3.UnitY;
-        var view = Matrix4x4.CreateLookAt(eye, center, up);
-        var projection = Matrix4x4.CreateOrthographic(
-            ShowcaseShadowDiameter,
-            ShowcaseShadowDiameter,
-            0.1f,
-            ShowcaseShadowDepth);
-        return view * projection;
+        Profiler.PlotValue("DirectionalShadowPass.SceneFitted", m_Projection.IsSceneFitted ? 1 : 0);
+        Profiler.PlotValue("DirectionalShadowPass.Diameter", m_Projection.Diameter);
+        Profiler.PlotValue("DirectionalShadowPass.Depth", m_Projection.Depth);
+        Profiler.PlotValue("DirectionalShadowPass.WorldUnitsPerTexel", m_Projection.WorldUnitsPerTexel);
     }
 
     private static bool IsDrawable(in MeshDrawCommand draw)

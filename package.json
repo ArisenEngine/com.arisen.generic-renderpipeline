@@ -17,7 +17,8 @@
   },
   "services": {
     "provides": [
-      "ArisenEngine.Rendering.IRenderMaterialLibrary"
+      "ArisenEngine.Rendering.IRenderMaterialLibrary",
+      "ArisenEngine.Rendering.IRenderPipelineProvider"
     ],
     "requires": [
       "ArisenEngine.Core.Assets.IAssetDatabase"

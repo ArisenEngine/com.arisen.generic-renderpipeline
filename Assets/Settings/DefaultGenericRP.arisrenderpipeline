@@ -1,0 +1,18 @@
+# Project-facing quality values. Render-pass topology remains code-owned by Generic RP.
+Version: 1
+Pipeline: GenericRP
+Name: Generic RP Default
+Fallback:
+  ClearColor:
+    R: 1.0
+    G: 0.4
+    B: 0.7
+    A: 1.0
+Shadows:
+  Enabled: true
+  MapSize: 2048
+  # Receiver comparison bias in normalized shadow depth.
+  DepthBias: 0.00165
+  SlopeBias: 0.00231
+  Strength: 0.78
+  PcfRadius: 1

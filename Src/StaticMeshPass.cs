@@ -17,11 +17,11 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     private const string VertexStage = "Vertex";
     private const string FragmentStage = "Fragment";
     private const int DrawsPerWorkItem = 256;
-    private const EFormat DepthTargetFormat = EFormat.FORMAT_D32_SFLOAT;
     private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
     private const int DefaultObjectDataRingSize = 2;
 
     private readonly IAssetDatabase m_AssetDatabase;
+    private readonly StaticMeshPassConfiguration m_Configuration;
     private RHIFactory m_Factory;
     private Matrix4x4 m_ViewProjection = Matrix4x4.Identity;
     private Matrix4x4 m_ShadowViewProjection = Matrix4x4.Identity;
@@ -68,12 +68,10 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     private bool m_EncodeOutputToSrgb;
     private EFormat m_ColorFormat = EFormat.FORMAT_UNDEFINED;
     private EFormat m_DepthFormat = EFormat.FORMAT_UNDEFINED;
-    private RHIImageHandle m_DepthImage = RHIImageHandle.Invalid;
     private RHIImageViewHandle m_DepthImageView = RHIImageViewHandle.Invalid;
+    private EFormat m_DepthTargetFormat = EFormat.FORMAT_UNDEFINED;
     private uint m_DepthWidth;
     private uint m_DepthHeight;
-    private bool m_DepthNeedsInitialTransition;
-    private bool m_RecordDepthInitialTransition;
     private int m_PipelineBatchCount;
     private int m_DrawBatchCount;
     private int m_WorkItemCount;
@@ -81,24 +79,39 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     private int m_OpaqueDrawCount;
     private int m_AlphaTestDrawCount;
     private int m_TransparentDrawCount;
+    private int m_SkippedAlphaDrawCount;
     private int m_FallbackPipelineBatchIndex = -1;
     private uint m_MaterialSlotVersion;
     private uint m_PreparedMaterialSlotVersion;
     private bool m_Disposed;
 
-    public StaticMeshPass(IAssetDatabase assetDatabase, string name = "StaticMeshPass") : base(name)
+    public int OpaqueDrawCount => m_OpaqueDrawCount;
+    public int AlphaTestDrawCount => m_AlphaTestDrawCount;
+    public int TransparentDrawCount => m_TransparentDrawCount;
+    public int SkippedAlphaDrawCount => m_SkippedAlphaDrawCount;
+
+    public StaticMeshPass(IAssetDatabase assetDatabase, string name = "StaticMeshPass")
+        : this(assetDatabase, name, StaticMeshPassConfiguration.Opaque)
+    {
+    }
+
+    internal StaticMeshPass(
+        IAssetDatabase assetDatabase,
+        string name,
+        StaticMeshPassConfiguration configuration) : base(name)
     {
         m_AssetDatabase = assetDatabase ?? throw new ArgumentNullException(nameof(assetDatabase));
+        m_Configuration = configuration;
     }
 
     protected override int GetWorkItemCount(RenderContext context)
     {
-        if (m_PreparedDrawCount <= 0)
+        if (m_WorkItemCount > 0)
         {
-            return m_FallbackPipelineBatchIndex >= 0 ? 1 : 0;
+            return m_WorkItemCount;
         }
 
-        return m_WorkItemCount;
+        return CanRecordFallbackMesh() || RequiresDepthClearWorkItem() ? 1 : 0;
     }
 
     protected override RenderPassWorkItem GetWorkItem(RenderContext context, int workItemIndex)
@@ -119,13 +132,13 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
 
     protected override void Record(RenderContext context, RenderCommandList commandList)
     {
-        if (m_PreparedDrawCount > 0)
+        if (m_WorkItemCount > 0)
         {
             RecordPreparedDrawBatches(context, commandList);
             return;
         }
 
-        RecordFallbackMesh(context, commandList);
+        RecordFallbackOrDepthClear(context, commandList);
     }
 
     private void RecordPreparedDrawBatches(RenderContext context, RenderCommandList commandList)
@@ -144,7 +157,45 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             return;
         }
 
-        RecordFallbackMesh(context, commandList);
+        RecordFallbackOrDepthClear(context, commandList);
+    }
+
+    private void RecordFallbackOrDepthClear(RenderContext context, RenderCommandList commandList)
+    {
+        if (CanRecordFallbackMesh())
+        {
+            RecordFallbackMesh(context, commandList);
+            return;
+        }
+
+        if (!RequiresDepthClearWorkItem())
+        {
+            return;
+        }
+
+        BeginStaticMeshRendering(
+            context,
+            commandList,
+            GetColorTargetImageView(context),
+            clearDepth: true);
+        commandList.EndRendering();
+    }
+
+    private bool CanRecordFallbackMesh()
+    {
+        if (m_PreparedDrawCount > 0 ||
+            m_FallbackPipelineBatchIndex < 0 ||
+            m_FallbackPipelineBatchIndex >= m_PipelineBatchCount)
+        {
+            return false;
+        }
+
+        return m_PipelineBatches[m_FallbackPipelineBatchIndex].IsValid;
+    }
+
+    private bool RequiresDepthClearWorkItem()
+    {
+        return m_Configuration.ClearDepthOnFirstWorkItem && m_DepthImageView.IsValid;
     }
 
     private void RecordFallbackMesh(RenderContext context, RenderCommandList commandList)
@@ -169,7 +220,11 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
                 $"[StaticMeshPass] RecordFallback | Surface: 0x{context.SurfaceId:X} | Size: {context.Width}x{context.Height} | Pipeline: {pipelineBatch.Pipeline.Index}:{pipelineBatch.Pipeline.Generation}");
         }
 
-        BeginStaticMeshRendering(context, commandList, colorImageView, clearDepth: true);
+        BeginStaticMeshRendering(
+            context,
+            commandList,
+            colorImageView,
+            clearDepth: m_Configuration.ClearDepthOnFirstWorkItem);
         RecordObjectDataBarrier(commandList);
 
         commandList.BindPipeline(pipelineBatch.Pipeline);
@@ -241,7 +296,11 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         var drawIndexEnd = Math.Min(m_BatchedDrawIndices.Length, workItem.DrawIndexStart + workItem.DrawIndexCount);
         var colorImageView = GetColorTargetImageView(context);
 
-        BeginStaticMeshRendering(context, commandList, colorImageView, clearDepth: firstWorkItem);
+        BeginStaticMeshRendering(
+            context,
+            commandList,
+            colorImageView,
+            clearDepth: firstWorkItem && m_Configuration.ClearDepthOnFirstWorkItem);
         RecordObjectDataBarrier(commandList);
 
         commandList.BindPipeline(pipelineBatch.Pipeline);
@@ -298,14 +357,6 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         RHIImageViewHandle colorImageView,
         bool clearDepth)
     {
-        if (clearDepth && m_RecordDepthInitialTransition && m_DepthImage.IsValid)
-        {
-            commandList.TransitionImageLayout(
-                m_DepthImage,
-                EImageLayout.IMAGE_LAYOUT_UNDEFINED,
-                EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-        }
-
         if (!m_DepthImageView.IsValid)
         {
             commandList.BeginRendering(
@@ -325,7 +376,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             EAttachmentStoreOp.ATTACHMENT_STORE_OP_STORE,
             0, 0, 0, 0,
             m_DepthImageView,
-            EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            m_Configuration.DepthWriteEnabled
+                ? EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                : EImageLayout.IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
             clearDepth ? EAttachmentLoadOp.ATTACHMENT_LOAD_OP_CLEAR : EAttachmentLoadOp.ATTACHMENT_LOAD_OP_LOAD,
             EAttachmentStoreOp.ATTACHMENT_STORE_OP_STORE,
             1.0f,
@@ -339,7 +392,8 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         var colorFormat = m_ColorTargetFormat != EFormat.FORMAT_UNDEFINED
             ? m_ColorTargetFormat
             : factory.GetImageViewFormat(context.SwapChain.GetImageView(context.FrameIndex));
-        var depthFormat = DepthTargetFormat;
+        ValidateDepthTarget(context.Width, context.Height);
+        var depthFormat = m_DepthTargetFormat;
         var encodeOutputToSrgb = RenderOutputEncoding.RequiresExplicitSrgbEncoding(colorFormat);
         if (m_EncodeOutputToSrgb != encodeOutputToSrgb)
         {
@@ -347,7 +401,6 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             RefreshFallbackDrawConstants();
         }
 
-        EnsureDepthTarget(factory, context.Width, context.Height, depthFormat);
         EnsurePipelineBatches(context, colorFormat, depthFormat);
         BuildDrawBatches(context);
         PrepareObjectDataBuffer(context, factory);
@@ -371,66 +424,41 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         m_PreparedDrawCount = drawCommands.Length;
     }
 
-    private void EnsureDepthTarget(RHIFactory factory, uint width, uint height, EFormat depthFormat)
+    internal void SetDepthTarget(
+        RHIImageViewHandle imageView,
+        EFormat format,
+        uint width,
+        uint height)
     {
-        m_Factory = factory;
-
-        if (m_DepthImage.IsValid &&
-            m_DepthImageView.IsValid &&
-            m_DepthWidth == width &&
-            m_DepthHeight == height &&
-            m_DepthFormat == depthFormat)
+        if (!imageView.IsValid ||
+            format == EFormat.FORMAT_UNDEFINED ||
+            width == 0 ||
+            height == 0)
         {
-            m_RecordDepthInitialTransition = m_DepthNeedsInitialTransition;
-            m_DepthNeedsInitialTransition = false;
-            return;
+            throw new ArgumentException($"[{Name}] Graph-owned depth target is invalid.", nameof(imageView));
         }
 
-        ReleaseDepthTargetResources();
-
+        m_DepthImageView = imageView;
+        m_DepthTargetFormat = format;
         m_DepthWidth = width;
         m_DepthHeight = height;
-        m_DepthFormat = depthFormat;
-        m_DepthImage = factory.CreateImage(
-            width,
-            height,
-            1,
-            1,
-            1,
-            depthFormat,
-            (uint)EImageUsageFlagBits.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-            ERHIMemoryUsage.GpuOnly,
-            "GenericStaticMeshDepth");
-        if (!m_DepthImage.IsValid)
-        {
-            throw new InvalidOperationException("[StaticMeshPass] Failed to create depth image.");
-        }
+    }
 
-        m_DepthImageView = factory.CreateImageView(
-            m_DepthImage,
-            EImageViewType.IMAGE_VIEW_TYPE_2D,
-            depthFormat,
-            (uint)EImageAspectFlagBits.IMAGE_ASPECT_DEPTH_BIT,
-            0,
-            1,
-            0,
-            1);
-        if (!m_DepthImageView.IsValid)
+    private void ValidateDepthTarget(uint width, uint height)
+    {
+        if (!m_DepthImageView.IsValid ||
+            m_DepthTargetFormat == EFormat.FORMAT_UNDEFINED ||
+            m_DepthWidth != width ||
+            m_DepthHeight != height)
         {
-            ReleaseDepthTargetResources();
-            throw new InvalidOperationException("[StaticMeshPass] Failed to create depth image view.");
+            throw new InvalidOperationException(
+                $"[{Name}] Graph-owned depth target does not match {width}x{height}.");
         }
-
-        m_DepthNeedsInitialTransition = true;
-        m_RecordDepthInitialTransition = true;
-        Logger.Log(
-            $"[StaticMeshPass] Created depth target | Size: {width}x{height} | Format: {depthFormat} | Image: {m_DepthImage.Index}:{m_DepthImage.Generation}");
     }
 
     private void EnsurePipelineBatches(RenderContext context, EFormat colorFormat, EFormat depthFormat)
     {
-        if (m_PipelineBatchCount > 0 &&
-            m_ColorFormat == colorFormat &&
+        if (m_ColorFormat == colorFormat &&
             m_DepthFormat == depthFormat &&
             m_PreparedMaterialSlotVersion == m_MaterialSlotVersion)
         {
@@ -449,7 +477,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         for (int i = 0; i < m_MaterialSlots.Length; i++)
         {
             var slot = m_MaterialSlots[i];
-            if (!slot.IsValid || slot.Shader == null)
+            if (!slot.IsValid ||
+                slot.Shader == null ||
+                !m_Configuration.Accepts(slot.RenderQueue.Class))
             {
                 continue;
             }
@@ -459,6 +489,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
                 slot.ShaderDependencyStamp,
                 slot.Shader.GetVariantIdentity(),
                 slot.RenderState,
+                m_Configuration.DepthWriteEnabled,
                 colorFormat,
                 depthFormat);
             int batchIndex = FindPipelineBatch(key);
@@ -470,7 +501,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             slot.PipelineBatchIndex = batchIndex;
             m_MaterialSlots[i] = slot;
 
-            if (i == 0)
+            if (i == 0 && m_Configuration.EnableFallbackMesh)
             {
                 m_FallbackPipelineBatchIndex = batchIndex;
             }
@@ -537,7 +568,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
                 key.RenderState.ColorBlendOp);
             batch.PipelineState.SetDepthStencilState(
                 key.DepthFormat != EFormat.FORMAT_UNDEFINED,
-                key.DepthFormat != EFormat.FORMAT_UNDEFINED,
+                key.DepthFormat != EFormat.FORMAT_UNDEFINED && key.DepthWriteEnabled,
                 ECompareOp.COMPARE_OP_LESS_OR_EQUAL);
             batch.PipelineState.SetDynamicStateMask(DynamicViewportScissorMask);
             batch.PipelineState.SetRenderingFormats(new[] { key.ColorFormat }, key.DepthFormat);
@@ -552,7 +583,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             int batchIndex = m_PipelineBatchCount++;
             m_PipelineBatches[batchIndex] = batch;
             Logger.Log(
-                $"[StaticMeshPass] Created pipeline batch | Batch: {batchIndex} | Shader: {key.ShaderGuid} | Format: {key.ColorFormat} | Cull: {key.RenderState.CullMode} | Blend: {key.RenderState.BlendEnabled} | Pipeline: {batch.Pipeline.Index}:{batch.Pipeline.Generation}");
+                $"[{Name}] Created pipeline batch | Batch: {batchIndex} | Shader: {key.ShaderGuid} | Format: {key.ColorFormat} | Cull: {key.RenderState.CullMode} | Blend: {key.RenderState.BlendEnabled} | DepthWrite: {key.DepthWriteEnabled} | Pipeline: {batch.Pipeline.Index}:{batch.Pipeline.Generation}");
             return batchIndex;
         }
         catch
@@ -582,6 +613,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         m_OpaqueDrawCount = 0;
         m_AlphaTestDrawCount = 0;
         m_TransparentDrawCount = 0;
+        m_SkippedAlphaDrawCount = 0;
 
         if (m_PreparedDrawCount <= 0 || m_PipelineBatchCount <= 0)
         {
@@ -596,23 +628,33 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         for (int i = 0; i < preparedDrawCount; i++)
         {
             ref readonly var draw = ref m_PreparedDraws[i];
+            var renderQueue = GetMaterialRenderQueue(draw.MaterialID);
+            if (!m_Configuration.Accepts(renderQueue.Class))
+            {
+                continue;
+            }
+
+            IncrementRenderQueueCount(renderQueue.Class);
             if (!IsDrawable(draw))
             {
+                IncrementSkippedAlphaDrawCount(renderQueue.Class);
                 continue;
             }
 
             int batchIndex = GetMaterialPipelineBatchIndex(draw.MaterialID);
             if (batchIndex >= 0)
             {
-                var renderQueue = GetMaterialRenderQueue(draw.MaterialID);
                 m_BatchedDrawSortKeys[sortedDrawCount] = StaticMeshDrawSortKey.From(
                     renderQueue,
                     batchIndex,
                     draw,
                     checked((uint)i));
                 m_BatchedDrawIndices[sortedDrawCount] = i;
-                IncrementRenderQueueCount(renderQueue.Class);
                 sortedDrawCount++;
+            }
+            else
+            {
+                IncrementSkippedAlphaDrawCount(renderQueue.Class);
             }
         }
 
@@ -621,7 +663,10 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             return;
         }
 
-        Array.Sort(m_BatchedDrawSortKeys, m_BatchedDrawIndices, 0, sortedDrawCount);
+        if (!m_Configuration.PreservePreparedDrawOrder)
+        {
+            Array.Sort(m_BatchedDrawSortKeys, m_BatchedDrawIndices, 0, sortedDrawCount);
+        }
 
         int batchStart = 0;
         int currentPipelineBatchIndex = m_BatchedDrawSortKeys[0].PipelineBatchIndex;
@@ -730,11 +775,26 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             opaqueDrawCount = 1;
         }
 
+        if (m_Configuration.QueuePolicy == StaticMeshPassQueuePolicy.Transparent)
+        {
+            Profiler.PlotValue("TransparentStaticMeshPass.DrawCount", effectiveDrawCount);
+            Profiler.PlotValue("TransparentStaticMeshPass.MaterialBatchCount", activeBatchCount);
+            Profiler.PlotValue("TransparentStaticMeshPass.TransparentDrawCount", m_TransparentDrawCount);
+            Profiler.PlotValue("TransparentStaticMeshPass.SkippedAlphaDrawCount", m_SkippedAlphaDrawCount);
+            Profiler.PlotValue("TransparentStaticMeshPass.PipelineBatchCount", m_PipelineBatchCount);
+            Profiler.PlotValue("TransparentStaticMeshPass.WorkItemCount", m_WorkItemCount);
+            Profiler.PlotValue("TransparentStaticMeshPass.ObjectDataCount", m_ObjectDataCount);
+            Profiler.PlotValue("TransparentStaticMeshPass.ObjectDataCapacity", m_ObjectDataBufferCapacity);
+            Profiler.PlotValue("TransparentStaticMeshPass.ObjectDataRingSize", m_ObjectDataRingSize);
+            return;
+        }
+
         Profiler.PlotValue("StaticMeshPass.DrawCount", effectiveDrawCount);
         Profiler.PlotValue("StaticMeshPass.MaterialBatchCount", activeBatchCount);
         Profiler.PlotValue("StaticMeshPass.OpaqueDrawCount", opaqueDrawCount);
         Profiler.PlotValue("StaticMeshPass.AlphaTestDrawCount", m_AlphaTestDrawCount);
         Profiler.PlotValue("StaticMeshPass.TransparentDrawCount", m_TransparentDrawCount);
+        Profiler.PlotValue("StaticMeshPass.SkippedAlphaDrawCount", m_SkippedAlphaDrawCount);
         Profiler.PlotValue("StaticMeshPass.PipelineBatchCount", m_PipelineBatchCount);
         Profiler.PlotValue("StaticMeshPass.WorkItemCount", m_WorkItemCount);
         Profiler.PlotValue("StaticMeshPass.ObjectDataCount", m_ObjectDataCount);
@@ -907,6 +967,10 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         uint shadowImageIndex,
         uint shadowSamplerIndex,
         float texelSize,
+        float depthBias,
+        float slopeBias,
+        float strength,
+        int pcfRadius,
         bool enabled)
     {
         m_ShadowViewProjection = shadowViewProjection;
@@ -914,6 +978,10 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             shadowImageIndex,
             shadowSamplerIndex,
             texelSize,
+            depthBias,
+            slopeBias,
+            strength,
+            pcfRadius,
             enabled);
     }
 
@@ -983,30 +1051,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         m_WorkItemCount = 0;
         m_FallbackPipelineBatchIndex = -1;
         m_ColorFormat = EFormat.FORMAT_UNDEFINED;
-    }
-
-    private void ReleaseDepthTargetResources()
-    {
-        if (m_Factory.IsValid)
-        {
-            if (m_DepthImageView.IsValid)
-            {
-                m_Factory.ReleaseImageView(m_DepthImageView);
-            }
-
-            if (m_DepthImage.IsValid)
-            {
-                m_Factory.ReleaseImage(m_DepthImage);
-            }
-        }
-
-        m_DepthImage = RHIImageHandle.Invalid;
-        m_DepthImageView = RHIImageViewHandle.Invalid;
-        m_DepthWidth = 0;
-        m_DepthHeight = 0;
         m_DepthFormat = EFormat.FORMAT_UNDEFINED;
-        m_DepthNeedsInitialTransition = false;
-        m_RecordDepthInitialTransition = false;
     }
 
     private void PrepareObjectDataBuffer(RenderContext context, RHIFactory factory)
@@ -1404,7 +1449,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             }
         }
 
-        return m_FallbackPipelineBatchIndex;
+        return m_Configuration.EnableFallbackMesh
+            ? m_FallbackPipelineBatchIndex
+            : -1;
     }
 
     private RenderQueueInfo GetMaterialRenderQueue(uint materialId)
@@ -1437,6 +1484,14 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         }
     }
 
+    private void IncrementSkippedAlphaDrawCount(RenderQueueClass queueClass)
+    {
+        if (queueClass is RenderQueueClass.AlphaTest or RenderQueueClass.Transparent)
+        {
+            m_SkippedAlphaDrawCount++;
+        }
+    }
+
     private static bool IsDrawable(in MeshDrawCommand draw)
     {
         return draw.VertexBuffer.IsValid &&
@@ -1452,11 +1507,45 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         }
 
         ReleasePipelineResources();
-        ReleaseDepthTargetResources();
         ReleaseObjectDataBuffers();
         m_Disposed = true;
     }
 
+}
+
+internal enum StaticMeshPassQueuePolicy : byte
+{
+    OpaqueAndAlphaTest,
+    Transparent
+}
+
+internal readonly record struct StaticMeshPassConfiguration(
+    StaticMeshPassQueuePolicy QueuePolicy,
+    bool DepthWriteEnabled,
+    bool ClearDepthOnFirstWorkItem,
+    bool PreservePreparedDrawOrder,
+    bool EnableFallbackMesh)
+{
+    public static StaticMeshPassConfiguration Opaque { get; } = new(
+        StaticMeshPassQueuePolicy.OpaqueAndAlphaTest,
+        DepthWriteEnabled: true,
+        ClearDepthOnFirstWorkItem: true,
+        PreservePreparedDrawOrder: false,
+        EnableFallbackMesh: true);
+
+    public static StaticMeshPassConfiguration Transparent { get; } = new(
+        StaticMeshPassQueuePolicy.Transparent,
+        DepthWriteEnabled: false,
+        ClearDepthOnFirstWorkItem: false,
+        PreservePreparedDrawOrder: true,
+        EnableFallbackMesh: false);
+
+    public bool Accepts(RenderQueueClass queueClass)
+    {
+        return QueuePolicy == StaticMeshPassQueuePolicy.Transparent
+            ? queueClass == RenderQueueClass.Transparent
+            : queueClass is RenderQueueClass.Opaque or RenderQueueClass.AlphaTest;
+    }
 }
 
 internal readonly record struct StaticMeshPipelineKey(
@@ -1464,6 +1553,7 @@ internal readonly record struct StaticMeshPipelineKey(
     AssetDependencyStamp ShaderDependencyStamp,
     string ShaderVariantIdentity,
     MaterialRenderState RenderState,
+    bool DepthWriteEnabled,
     EFormat ColorFormat,
     EFormat DepthFormat);
 
@@ -1935,7 +2025,7 @@ internal readonly struct StaticMeshShadowConstants
 
     public static StaticMeshShadowConstants Disabled => new(
         new Vector4(InvalidBindlessIndex, InvalidBindlessIndex, 0.0f, 0.0f),
-        new Vector4(0.0022f, 0.78f, 1.0f / 2048.0f, 0.0f));
+        new Vector4(0.0f, 0.0f, 1.0f / 2048.0f, 0.0f));
 
     public readonly Vector4 TextureIndices;
     public readonly Vector4 Parameters;
@@ -1950,6 +2040,10 @@ internal readonly struct StaticMeshShadowConstants
         uint shadowImageIndex,
         uint shadowSamplerIndex,
         float texelSize,
+        float depthBias,
+        float slopeBias,
+        float strength,
+        int pcfRadius,
         bool enabled)
     {
         bool isEnabled = enabled &&
@@ -1957,8 +2051,8 @@ internal readonly struct StaticMeshShadowConstants
                          shadowSamplerIndex != InvalidBindlessIndex &&
                          texelSize > 0.0f;
         return new StaticMeshShadowConstants(
-            new Vector4(shadowImageIndex, shadowSamplerIndex, 0.0f, 0.0f),
-            new Vector4(0.0022f, 0.78f, texelSize, isEnabled ? 1.0f : 0.0f));
+            new Vector4(shadowImageIndex, shadowSamplerIndex, pcfRadius, slopeBias),
+            new Vector4(depthBias, strength, texelSize, isEnabled ? 1.0f : 0.0f));
     }
 }
 
