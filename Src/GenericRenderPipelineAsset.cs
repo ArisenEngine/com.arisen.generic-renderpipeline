@@ -11,6 +11,7 @@ public class GenericRenderPipelineAsset : RenderPipelineAsset
     private readonly IAssetDatabase? m_AssetDatabase;
     private readonly GenericRenderMaterialLibrary? m_MaterialLibrary;
     private readonly DeferredRenderResourceDisposalQueue? m_DisposalQueue;
+    private readonly GenericPreparedAssetProvider? m_PreparedAssetProvider;
 
     public GenericRenderPipelineAsset()
     {
@@ -20,12 +21,14 @@ public class GenericRenderPipelineAsset : RenderPipelineAsset
         GenericRenderPipelineSettings settings,
         IAssetDatabase assetDatabase,
         GenericRenderMaterialLibrary materialLibrary,
-        DeferredRenderResourceDisposalQueue disposalQueue)
+        DeferredRenderResourceDisposalQueue disposalQueue,
+        GenericPreparedAssetProvider preparedAssetProvider)
     {
         m_Settings = settings;
         m_AssetDatabase = assetDatabase;
         m_MaterialLibrary = materialLibrary;
         m_DisposalQueue = disposalQueue;
+        m_PreparedAssetProvider = preparedAssetProvider;
     }
 
     protected override void AfterDeserialize()
@@ -41,6 +44,7 @@ public class GenericRenderPipelineAsset : RenderPipelineAsset
             m_Settings,
             m_AssetDatabase ?? throw new InvalidOperationException("[GenericRP] Asset database service was not assigned."),
             m_MaterialLibrary ?? throw new InvalidOperationException("[GenericRP] Material library service was not assigned."),
-            m_DisposalQueue ?? throw new InvalidOperationException("[GenericRP] Deferred disposal queue was not assigned."));
+            m_DisposalQueue ?? throw new InvalidOperationException("[GenericRP] Deferred disposal queue was not assigned."),
+            m_PreparedAssetProvider ?? throw new InvalidOperationException("[GenericRP] Prepared asset provider was not assigned."));
     }
 }

@@ -49,14 +49,7 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
         string name = "DirectionalShadowPass") : base(name)
     {
         m_AssetDatabase = assetDatabase ?? throw new ArgumentNullException(nameof(assetDatabase));
-        m_Shader = new ShaderAsset(
-            GenericRenderPipelineAssetRefs.DirectionalShadowShader.Ref.Guid,
-            "GenericRP/DirectionalShadow",
-            new ShaderStageAsset[]
-            {
-                new(VertexStage, EProgramStage.Vertex, "VSMain")
-            },
-            ShaderVariantKey.VulkanDebug);
+        m_Shader = GenericRenderPipelineShaderAssets.CreateDirectionalShadow();
     }
 
     public void SetDepthTarget(

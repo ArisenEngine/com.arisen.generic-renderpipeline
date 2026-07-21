@@ -37,6 +37,16 @@ public static class GenericRenderPipelineSettingsLoader
     public const string AssetType = "RenderPipelineSettings";
     public const string ProviderPackageId = "com.arisen.generic-renderpipeline";
 
+    public static GenericRenderPipelineSettings Load(
+        IAssetDatabase assetDatabase,
+        AssetRef<RenderPipelineSettingsSourceAsset> settingsRef)
+    {
+        ArgumentNullException.ThrowIfNull(assetDatabase);
+        return assetDatabase.CanReadSourceAssets
+            ? LoadSource(assetDatabase, settingsRef)
+            : GenericRenderPipelineSettingsCooker.LoadCooked(assetDatabase, settingsRef);
+    }
+
     public static GenericRenderPipelineSettings LoadSource(
         IAssetDatabase assetDatabase,
         AssetRef<RenderPipelineSettingsSourceAsset> settingsRef)

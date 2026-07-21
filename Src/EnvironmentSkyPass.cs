@@ -41,15 +41,7 @@ public sealed class EnvironmentSkyPass : RenderPassNode, IDisposable
         string name = "EnvironmentSkyPass") : base(name)
     {
         m_AssetDatabase = assetDatabase ?? throw new ArgumentNullException(nameof(assetDatabase));
-        m_Shader = new ShaderAsset(
-            GenericRenderPipelineAssetRefs.EnvironmentSkyShader.Ref.Guid,
-            "GenericRP/EnvironmentSky",
-            new ShaderStageAsset[]
-            {
-                new(VertexStage, EProgramStage.Vertex, "VSMain"),
-                new(FragmentStage, EProgramStage.Fragment, "PSMain")
-            },
-            ShaderVariantKey.VulkanDebug);
+        m_Shader = GenericRenderPipelineShaderAssets.CreateEnvironmentSky();
     }
 
     public void SetEnvironment(SceneEnvironment environment)

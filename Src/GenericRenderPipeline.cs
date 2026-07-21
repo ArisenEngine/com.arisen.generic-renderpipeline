@@ -23,6 +23,7 @@ public class GenericRenderPipeline : RenderPipeline
     private readonly TonemapPass m_TonemapPass;
     private readonly RenderResourceReloadQueue m_ReloadQueue = new();
     private readonly DeferredRenderResourceDisposalQueue m_DisposalQueue;
+    private readonly GenericPreparedAssetProvider m_PreparedAssetProvider;
     private readonly Dictionary<Guid, RHIStaticMeshResource> m_SceneMeshes = new();
     private RHIEnvironmentTextureResource? m_EnvironmentTexture;
     private RHIEnvironmentLightingResource? m_EnvironmentLighting;
@@ -54,13 +55,16 @@ public class GenericRenderPipeline : RenderPipeline
         GenericRenderPipelineSettings settings,
         IAssetDatabase assetDatabase,
         GenericRenderMaterialLibrary materialLibrary,
-        DeferredRenderResourceDisposalQueue disposalQueue)
+        DeferredRenderResourceDisposalQueue disposalQueue,
+        GenericPreparedAssetProvider preparedAssetProvider)
     {
         m_Settings = settings;
         m_ClearColor = settings.FallbackClearColor;
         m_AssetDatabase = assetDatabase ?? throw new ArgumentNullException(nameof(assetDatabase));
         m_MaterialLibrary = materialLibrary ?? throw new ArgumentNullException(nameof(materialLibrary));
         m_DisposalQueue = disposalQueue ?? throw new ArgumentNullException(nameof(disposalQueue));
+        m_PreparedAssetProvider = preparedAssetProvider
+            ?? throw new ArgumentNullException(nameof(preparedAssetProvider));
         m_DirectionalShadowPass = new DirectionalShadowPass(assetDatabase);
         m_EnvironmentSkyPass = new EnvironmentSkyPass(assetDatabase);
         m_StaticMeshPass = new StaticMeshPass(assetDatabase, "GenericStaticMeshPass");
@@ -350,6 +354,7 @@ public class GenericRenderPipeline : RenderPipeline
     protected override void OnFrameSubmitted(RenderContext context, ulong submittedTicket)
     {
         m_LastSubmittedTicket = submittedTicket;
+        m_PreparedAssetProvider.UpdateSubmittedTicket(submittedTicket);
         m_DisposalQueue.ReleaseCompleted(context.Device);
     }
 
@@ -362,6 +367,7 @@ public class GenericRenderPipeline : RenderPipeline
     {
         var device = context.Device;
         m_LastDevice = device;
+        m_PreparedAssetProvider.UpdateFrameContext(device, m_LastSubmittedTicket);
 
         var dirtyGuids = m_ReloadQueue.Drain();
         if (dirtyGuids.Length > 0)
@@ -408,6 +414,7 @@ public class GenericRenderPipeline : RenderPipeline
 
     private void ApplyAssetInvalidations(ReadOnlySpan<Guid> dirtyGuids)
     {
+        m_PreparedAssetProvider.InvalidateByAssetGuids(dirtyGuids);
         m_MaterialLibrary.InvalidateByAssetGuids(dirtyGuids, m_LastSubmittedTicket);
         m_FailedEnvironmentTextureGuid = Guid.Empty;
         m_FailedEnvironmentTextureStamp = AssetDependencyStamp.Empty;
@@ -454,6 +461,17 @@ public class GenericRenderPipeline : RenderPipeline
             return null;
         }
 
+        if (m_PreparedAssetProvider.TryGetEnvironment(
+                desiredGuid,
+                out RHIEnvironmentTextureResource preparedTexture,
+                out _))
+        {
+            ReleaseEnvironmentTexture();
+            m_FailedEnvironmentTextureGuid = Guid.Empty;
+            m_FailedEnvironmentTextureStamp = AssetDependencyStamp.Empty;
+            return preparedTexture;
+        }
+
         if (m_EnvironmentTexture is { IsValid: true } current)
         {
             if (current.Asset.Guid == desiredGuid && !current.IsSourceStale())
@@ -468,7 +486,7 @@ public class GenericRenderPipeline : RenderPipeline
         var dependencyStamp = AssetDependencyTracker.GetAssetStamp(m_AssetDatabase, desiredGuid);
         try
         {
-            asset = EnvironmentTextureAssetLoader.LoadSource(m_AssetDatabase, desiredGuid);
+            asset = EnvironmentTextureAssetLoader.Load(m_AssetDatabase, desiredGuid);
             dependencyStamp = AssetDependencyTracker.GetEnvironmentTextureStamp(m_AssetDatabase, asset);
             if (m_FailedEnvironmentTextureGuid == desiredGuid &&
                 m_FailedEnvironmentTextureStamp == dependencyStamp)
@@ -524,6 +542,17 @@ public class GenericRenderPipeline : RenderPipeline
         }
 
         var asset = environmentTexture.Asset;
+        if (m_PreparedAssetProvider.TryGetEnvironment(
+                asset.Guid,
+                out _,
+                out RHIEnvironmentLightingResource preparedLighting))
+        {
+            ReleaseEnvironmentLighting();
+            m_FailedEnvironmentLightingGuid = Guid.Empty;
+            m_FailedEnvironmentLightingStamp = AssetDependencyStamp.Empty;
+            return preparedLighting;
+        }
+
         if (m_EnvironmentLighting is { IsValid: true } current)
         {
             if (current.Asset.Guid == asset.Guid && !current.IsSourceStale())
@@ -882,6 +911,16 @@ public class GenericRenderPipeline : RenderPipeline
 
     private RHIStaticMeshResource GetOrCreateSceneMesh(RHIDevice device, Guid meshGuid)
     {
+        if (m_PreparedAssetProvider.TryGetMesh(meshGuid, out RHIStaticMeshResource preparedMesh))
+        {
+            if (m_SceneMeshes.Remove(meshGuid, out RHIStaticMeshResource? duplicate))
+            {
+                m_DisposalQueue.Enqueue(duplicate, m_LastSubmittedTicket);
+            }
+
+            return preparedMesh;
+        }
+
         if (m_SceneMeshes.TryGetValue(meshGuid, out var mesh))
         {
             if (mesh.IsValid && !mesh.IsSourceStale())
@@ -904,22 +943,32 @@ public class GenericRenderPipeline : RenderPipeline
 
     private MeshAsset CreateMeshAsset(Guid meshGuid)
     {
-        if (!m_AssetDatabase.TryGetAsset(meshGuid, out var asset))
+        if (!m_AssetDatabase.TryGetAssetDescriptor(meshGuid, out AssetDescriptor descriptor))
         {
             throw new InvalidOperationException($"[GenericRenderPipeline] Scene mesh asset '{meshGuid}' was not found.");
         }
 
-        if (!string.Equals(asset.AssetType, "Mesh", StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(descriptor.AssetType, "Mesh", StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException(
-                $"[GenericRenderPipeline] Scene asset '{meshGuid}' has type '{asset.AssetType}', expected Mesh.");
+                $"[GenericRenderPipeline] Scene asset '{meshGuid}' has type '{descriptor.AssetType}', expected Mesh.");
+        }
+
+        if (m_AssetDatabase.CanReadSourceAssets &&
+            m_AssetDatabase.TryGetAsset(meshGuid, out AssetRecord? sourceAsset))
+        {
+            return new MeshAsset(
+                meshGuid,
+                Path.GetFileNameWithoutExtension(sourceAsset.SourcePath),
+                MeshVariantKey.Default,
+                ResolveMeshSourceFormat(sourceAsset.SourcePath));
         }
 
         return new MeshAsset(
             meshGuid,
-            Path.GetFileNameWithoutExtension(asset.SourcePath),
+            $"RuntimeMesh/{meshGuid:N}",
             MeshVariantKey.Default,
-            ResolveMeshSourceFormat(asset.SourcePath));
+            MeshSourceFormat.ArisenTextMesh);
     }
 
     private uint ResolveMaterialId(Guid materialGuid)
