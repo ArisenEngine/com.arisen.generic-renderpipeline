@@ -14,6 +14,7 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
     private readonly Dictionary<Guid, uint> m_MaterialIDs = new();
     private readonly List<MaterialEntry> m_Materials = new();
     private readonly DeferredRenderResourceDisposalQueue m_DisposalQueue;
+    private readonly SharedRHITexture2DResourceCache m_TextureCache = new();
     private bool m_Disposed;
 
     public uint DefaultMaterialID { get; private set; }
@@ -45,6 +46,10 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
             return preparedCount;
         }
     }
+
+    public int PreparedTextureCount => m_TextureCache.ResourceCount;
+
+    public long EstimatedTextureGpuBytes => m_TextureCache.EstimatedGpuBytes;
 
     public GenericRenderMaterialLibrary(
         IAssetDatabase assetDatabase,
@@ -201,26 +206,67 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
 
         for (int i = 0; i < m_Materials.Count; i++)
         {
-            var entry = m_Materials[i];
-            if (entry.Resource is { IsValid: true } && !entry.Resource.IsSourceStale())
-            {
-                continue;
-            }
-
-            if (entry.Resource != null)
-            {
-                Logger.Log($"[GenericRenderMaterialLibrary] Material dependency changed; reloading material ID {entry.MaterialID}.");
-                m_DisposalQueue.Enqueue(entry.Resource, submittedTicket);
-                entry.Resource = null;
-            }
-
-            var cookedMaterial = MaterialAssetCooker.LoadOrCook(m_AssetDatabase, entry.MaterialGuid);
-            entry.Resource = new RHIMaterialResource(device, m_AssetDatabase, cookedMaterial.Asset, cookedMaterial.Handle);
-            m_Materials[i] = entry;
-
-            Logger.Log(
-                $"[GenericRenderMaterialLibrary] Prepared material | ID: {entry.MaterialID} | Name: {cookedMaterial.Asset.Name} | Shader: {cookedMaterial.Asset.Shader.Name}");
+            EnsurePreparedAtIndex(device, submittedTicket, i);
         }
+    }
+
+    public void EnsurePrepared(RHIDevice device, uint materialId, ulong submittedTicket)
+    {
+        ThrowIfDisposed();
+        if (!device.IsValid)
+        {
+            throw new ArgumentException(
+                "[GenericRenderMaterialLibrary] Cannot prepare a material with an invalid RHI device.",
+                nameof(device));
+        }
+
+        int index = GetMaterialIndex(materialId);
+        EnsurePreparedAtIndex(device, submittedTicket, index);
+    }
+
+    public bool TryGetPreparedMaterial(Guid materialGuid, out RHIMaterialResource resource)
+    {
+        ThrowIfDisposed();
+        if (m_MaterialIDs.TryGetValue(materialGuid, out uint materialId))
+        {
+            int index = GetMaterialIndex(materialId);
+            if (m_Materials[index].Resource is { IsValid: true } prepared)
+            {
+                resource = prepared;
+                return true;
+            }
+        }
+
+        resource = null!;
+        return false;
+    }
+
+    public bool ReleasePrepared(
+        Guid materialGuid,
+        ulong submittedTicket,
+        bool disposeImmediately = false)
+    {
+        ThrowIfDisposed();
+        if (!m_MaterialIDs.TryGetValue(materialGuid, out uint materialId) ||
+            materialId == DefaultMaterialID)
+        {
+            return false;
+        }
+
+        int index = GetMaterialIndex(materialId);
+        MaterialEntry entry = m_Materials[index];
+        if (entry.Resource == null) return false;
+        if (disposeImmediately)
+        {
+            entry.Resource.Dispose();
+        }
+        else
+        {
+            m_DisposalQueue.Enqueue(entry.Resource, submittedTicket);
+        }
+        entry.Resource = null;
+        m_Materials[index] = entry;
+        return true;
     }
 
     public void ApplyMaterialSlots(StaticMeshPass pass)
@@ -260,6 +306,8 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
             return;
         }
 
+        ReleasePreparedResources();
+        m_TextureCache.Dispose();
         m_MaterialIDs.Clear();
         m_Materials.Clear();
         DefaultMaterialID = 0;
@@ -318,6 +366,57 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
         {
             throw new ObjectDisposedException(nameof(GenericRenderMaterialLibrary));
         }
+    }
+
+    private int GetMaterialIndex(uint materialId)
+    {
+        if (materialId < FirstMaterialID)
+        {
+            throw new InvalidOperationException(
+                $"[GenericRenderMaterialLibrary] Material ID {materialId} is invalid.");
+        }
+
+        int index = checked((int)(materialId - FirstMaterialID));
+        if ((uint)index >= (uint)m_Materials.Count || m_Materials[index].MaterialID != materialId)
+        {
+            throw new InvalidOperationException(
+                $"[GenericRenderMaterialLibrary] Material ID {materialId} is not registered.");
+        }
+
+        return index;
+    }
+
+    private void EnsurePreparedAtIndex(
+        RHIDevice device,
+        ulong submittedTicket,
+        int index)
+    {
+        var entry = m_Materials[index];
+        if (entry.Resource is { IsValid: true } && !entry.Resource.IsSourceStale())
+        {
+            return;
+        }
+
+        if (entry.Resource != null)
+        {
+            Logger.Log(
+                $"[GenericRenderMaterialLibrary] Material dependency changed; reloading material ID {entry.MaterialID}.");
+            m_DisposalQueue.Enqueue(entry.Resource, submittedTicket);
+            entry.Resource = null;
+        }
+
+        var cookedMaterial = MaterialAssetCooker.LoadOrCook(m_AssetDatabase, entry.MaterialGuid);
+        entry.Resource = new RHIMaterialResource(
+            device,
+            m_AssetDatabase,
+            cookedMaterial.Asset,
+            cookedMaterial.Handle,
+            m_TextureCache);
+        m_Materials[index] = entry;
+
+        Logger.Log(
+            $"[GenericRenderMaterialLibrary] Prepared material | ID: {entry.MaterialID} | " +
+            $"Name: {cookedMaterial.Asset.Name} | Shader: {cookedMaterial.Asset.Shader.Name}");
     }
 
     private struct MaterialEntry

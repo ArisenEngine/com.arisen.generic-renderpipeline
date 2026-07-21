@@ -37,15 +37,7 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
         string name = "TonemapPass") : base(name)
     {
         m_AssetDatabase = assetDatabase ?? throw new ArgumentNullException(nameof(assetDatabase));
-        m_Shader = new ShaderAsset(
-            GenericRenderPipelineAssetRefs.TonemapShader.Ref.Guid,
-            "GenericRP/Tonemap",
-            new ShaderStageAsset[]
-            {
-                new(VertexStage, EProgramStage.Vertex, "VSMain"),
-                new(FragmentStage, EProgramStage.Fragment, "PSMain")
-            },
-            ShaderVariantKey.VulkanDebug);
+        m_Shader = GenericRenderPipelineShaderAssets.CreateTonemap();
     }
 
     public void SetSceneColor(

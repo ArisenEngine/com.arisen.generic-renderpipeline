@@ -21,7 +21,10 @@
       "ArisenEngine.Rendering.IRenderPipelineProvider"
     ],
     "requires": [
-      "ArisenEngine.Core.Assets.IAssetDatabase"
+      "ArisenEngine.Core.Assets.IAssetDatabase",
+      "ArisenEngine.Core.Assets.IRuntimeAssetCookerRegistry",
+      "ArisenEngine.Rendering.IRuntimeShaderCookRecipeRegistry",
+      "ArisenEngine.Resources.Serialization.IRuntimeAssetResidencyService"
     ]
   }
 }

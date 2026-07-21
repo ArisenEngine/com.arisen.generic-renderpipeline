@@ -9,16 +9,20 @@ public sealed class GenericRenderPipelineProvider : IRenderPipelineProvider
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly GenericRenderMaterialLibrary m_MaterialLibrary;
     private readonly DeferredRenderResourceDisposalQueue m_DisposalQueue;
+    private readonly GenericPreparedAssetProvider m_PreparedAssetProvider;
     private GenericRenderPipelineAsset? m_ActiveAsset;
 
     public GenericRenderPipelineProvider(
         IAssetDatabase assetDatabase,
         GenericRenderMaterialLibrary materialLibrary,
-        DeferredRenderResourceDisposalQueue disposalQueue)
+        DeferredRenderResourceDisposalQueue disposalQueue,
+        GenericPreparedAssetProvider preparedAssetProvider)
     {
         m_AssetDatabase = assetDatabase ?? throw new ArgumentNullException(nameof(assetDatabase));
         m_MaterialLibrary = materialLibrary ?? throw new ArgumentNullException(nameof(materialLibrary));
         m_DisposalQueue = disposalQueue ?? throw new ArgumentNullException(nameof(disposalQueue));
+        m_PreparedAssetProvider = preparedAssetProvider
+            ?? throw new ArgumentNullException(nameof(preparedAssetProvider));
     }
 
     public string ProviderPackageId => GenericRenderPipelineSettingsLoader.ProviderPackageId;
@@ -38,7 +42,7 @@ public sealed class GenericRenderPipelineProvider : IRenderPipelineProvider
             settings.Guid,
             SettingsAssetType,
             settings.PackageId);
-        var loadedSettings = GenericRenderPipelineSettingsLoader.LoadSource(
+        var loadedSettings = GenericRenderPipelineSettingsLoader.Load(
             m_AssetDatabase,
             settingsRef);
 
@@ -47,7 +51,8 @@ public sealed class GenericRenderPipelineProvider : IRenderPipelineProvider
             loadedSettings,
             m_AssetDatabase,
             m_MaterialLibrary,
-            m_DisposalQueue);
+            m_DisposalQueue,
+            m_PreparedAssetProvider);
         Graphics.SetCurrentRenderPipeline(m_ActiveAsset);
         KernelLog.InfoFormat(
             "[GenericRP] Activated settings '{0}' ({1}) | Shadow: {2}, {3}x{3}, PCF radius {4}.",
@@ -67,5 +72,10 @@ public sealed class GenericRenderPipelineProvider : IRenderPipelineProvider
         }
 
         m_ActiveAsset = null;
+    }
+
+    public void ReleaseDeviceResources()
+    {
+        m_PreparedAssetProvider.ReleaseAll(disposeImmediately: true);
     }
 }
