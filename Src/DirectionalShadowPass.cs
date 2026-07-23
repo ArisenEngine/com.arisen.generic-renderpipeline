@@ -12,6 +12,8 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
 {
     private const ulong DynamicViewportScissorMask = 0x1UL | 0x2UL;
     private const string VertexStage = "Vertex";
+    private const float RasterDepthBiasConstantFactor = 1.25f;
+    private const float RasterDepthBiasSlopeFactor = 1.75f;
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly ShaderAsset m_Shader;
     private RHIFactory m_Factory;
@@ -145,10 +147,13 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
                 MeshAssetCooker.StaticMeshVertexStride,
                 EVertexInputRate.VERTEX_INPUT_RATE_VERTEX);
             m_PipelineState.AddVertexInputAttributeDescription(0, 0, EFormat.FORMAT_R32G32B32_SFLOAT, 0);
-            m_PipelineState.SetRasterizationState(
+            m_PipelineState.SetRasterizationStateWithDepthBias(
                 EPolygonMode.EPOLYGON_MODE_FILL,
                 ECullModeFlagBits.CULL_MODE_BACK_BIT,
-                EFrontFace.FRONT_FACE_COUNTER_CLOCKWISE);
+                EFrontFace.FRONT_FACE_COUNTER_CLOCKWISE,
+                RasterDepthBiasConstantFactor,
+                depthBiasClamp: 0.0f,
+                depthBiasSlopeFactor: RasterDepthBiasSlopeFactor);
             m_PipelineState.SetColorBlendState(false);
             m_PipelineState.SetDepthStencilState(true, true, ECompareOp.COMPARE_OP_LESS_OR_EQUAL);
             m_PipelineState.SetDynamicStateMask(DynamicViewportScissorMask);
@@ -163,7 +168,9 @@ internal sealed class DirectionalShadowPass : RenderPassNode, IDisposable
 
             m_ShaderStamp = shaderStamp;
             Logger.Log(
-                $"[DirectionalShadowPass] Prepared pipeline | DepthFormat: {depthFormat} | Pipeline: {m_Pipeline.Index}:{m_Pipeline.Generation}");
+                $"[DirectionalShadowPass] Prepared pipeline | DepthFormat: {depthFormat} | " +
+                $"RasterBias: {RasterDepthBiasConstantFactor}/{RasterDepthBiasSlopeFactor} | " +
+                $"Pipeline: {m_Pipeline.Index}:{m_Pipeline.Generation}");
             PlotDiagnostics();
         }
         catch
