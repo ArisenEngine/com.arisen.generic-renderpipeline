@@ -21,7 +21,11 @@ public readonly record struct GenericShadowSettings(
     float DepthBias,
     float SlopeBias,
     float Strength,
-    int PcfRadius)
+    int PcfRadius,
+    int CascadeCount,
+    float MaximumDistance,
+    float PracticalSplitWeight,
+    float TerminalFadeFraction)
 {
     public static GenericShadowSettings Default { get; } = new(
         Enabled: true,
@@ -29,7 +33,11 @@ public readonly record struct GenericShadowSettings(
         DepthBias: 0.00165f,
         SlopeBias: 0.00231f,
         Strength: 0.78f,
-        PcfRadius: 1);
+        PcfRadius: 1,
+        CascadeCount: 4,
+        MaximumDistance: 250.0f,
+        PracticalSplitWeight: 0.65f,
+        TerminalFadeFraction: 0.10f);
 }
 
 public static class GenericRenderPipelineSettingsLoader
@@ -104,12 +112,16 @@ public static class GenericRenderPipelineSettingsLoader
                 source.Shadows.DepthBias,
                 source.Shadows.SlopeBias,
                 source.Shadows.Strength,
-                source.Shadows.PcfRadius));
+                source.Shadows.PcfRadius,
+                source.Shadows.CascadeCount,
+                source.Shadows.MaximumDistance,
+                source.Shadows.PracticalSplitWeight,
+                source.Shadows.TerminalFadeFraction));
     }
 
     private sealed class SerializedSettings
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = 2;
         public string Pipeline { get; set; } = "GenericRP";
         public string Name { get; set; } = string.Empty;
         public SerializedFallback Fallback { get; set; } = new();
@@ -117,7 +129,7 @@ public static class GenericRenderPipelineSettingsLoader
 
         public void Validate(string sourcePath)
         {
-            if (Version != 1)
+            if (Version is not (1 or 2))
             {
                 throw Invalid(sourcePath, $"version '{Version}' is not supported");
             }
@@ -165,6 +177,10 @@ public static class GenericRenderPipelineSettingsLoader
         public float SlopeBias { get; set; } = 0.00231f;
         public float Strength { get; set; } = 0.78f;
         public int PcfRadius { get; set; } = 1;
+        public int CascadeCount { get; set; } = GenericShadowSettings.Default.CascadeCount;
+        public float MaximumDistance { get; set; } = GenericShadowSettings.Default.MaximumDistance;
+        public float PracticalSplitWeight { get; set; } = GenericShadowSettings.Default.PracticalSplitWeight;
+        public float TerminalFadeFraction { get; set; } = GenericShadowSettings.Default.TerminalFadeFraction;
 
         public void Validate(string sourcePath)
         {
@@ -180,6 +196,30 @@ public static class GenericRenderPipelineSettingsLoader
             {
                 throw Invalid(sourcePath, "Shadows.PcfRadius must be between 0 and 3");
             }
+
+            if (CascadeCount < 1 || CascadeCount > 4)
+            {
+                throw Invalid(sourcePath, "Shadows.CascadeCount must be between 1 and 4");
+            }
+
+            ValidateFiniteRange(
+                sourcePath,
+                "Shadows.MaximumDistance",
+                MaximumDistance,
+                5.0f,
+                10000.0f);
+            ValidateFiniteRange(
+                sourcePath,
+                "Shadows.PracticalSplitWeight",
+                PracticalSplitWeight,
+                0.0f,
+                1.0f);
+            ValidateFiniteRange(
+                sourcePath,
+                "Shadows.TerminalFadeFraction",
+                TerminalFadeFraction,
+                0.0f,
+                0.5f);
         }
     }
 

@@ -5,6 +5,7 @@ using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Core.RHI;
 using ArisenEngine.Rendering.Resources;
 using ArisenEngine.Threading;
+using ArisenKernel.Diagnostics;
 using System.IO;
 using System.Numerics;
 
@@ -12,18 +13,24 @@ namespace ArisenEngine.Rendering;
 
 public class GenericRenderPipeline : RenderPipeline
 {
+    private const int MaximumDirectionalShadowDrawCommands = 65536;
+
     private readonly GenericRenderPipelineSettings m_Settings;
     private readonly Color m_ClearColor;
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly GenericRenderMaterialLibrary m_MaterialLibrary;
     private readonly DirectionalShadowPass m_DirectionalShadowPass;
+    private readonly DirectionalShadowFrameBuffer m_DirectionalShadowFrameBuffer = new();
+    private readonly EnvironmentFrameBuffer m_EnvironmentFrameBuffer = new();
     private readonly EnvironmentSkyPass m_EnvironmentSkyPass;
+    private readonly OutdoorAtmospherePass m_OutdoorAtmospherePass;
     private readonly StaticMeshPass m_StaticMeshPass;
     private readonly StaticMeshPass m_TransparentStaticMeshPass;
     private readonly TonemapPass m_TonemapPass;
     private readonly RenderResourceReloadQueue m_ReloadQueue = new();
     private readonly DeferredRenderResourceDisposalQueue m_DisposalQueue;
     private readonly GenericPreparedAssetProvider m_PreparedAssetProvider;
+    private readonly IGenericRenderPipelineFeature[] m_Features;
     private readonly Dictionary<Guid, RHIStaticMeshResource> m_SceneMeshes = new();
     private RHIEnvironmentTextureResource? m_EnvironmentTexture;
     private RHIEnvironmentLightingResource? m_EnvironmentLighting;
@@ -44,19 +51,26 @@ public class GenericRenderPipeline : RenderPipeline
     private int m_AlphaTestDrawCommandCount;
     private int m_SkippedAlphaDrawCommandCount;
     private int m_ShadowDrawCommandCount;
+    private int m_DroppedShadowDrawCommandCount;
     private StaticMeshCullingStats m_StaticMeshCullingStats;
     private StaticMeshCullingStats m_ShadowCasterCullingStats;
     private DirectionalShadowBoundsAccumulator m_ShadowReceiverBounds;
+    private DirectionalShadowCascadeDrawRangeSet m_ShadowDrawRanges;
+    private DirectionalShadowFrameData m_DirectionalShadowFrameData;
+    private EnvironmentFrameData m_EnvironmentFrameData;
     private RHIDevice m_LastDevice;
+    private ulong m_DeviceGeneration;
     private ulong m_LastSubmittedTicket;
     private RHIStaticMeshResource? m_FallbackMesh;
+    private GenericRenderPipelineFeatureFrameContext m_CurrentFeatureFrameContext;
 
     public GenericRenderPipeline(
         GenericRenderPipelineSettings settings,
         IAssetDatabase assetDatabase,
         GenericRenderMaterialLibrary materialLibrary,
         DeferredRenderResourceDisposalQueue disposalQueue,
-        GenericPreparedAssetProvider preparedAssetProvider)
+        GenericPreparedAssetProvider preparedAssetProvider,
+        IGenericRenderPipelineFeature[] features)
     {
         m_Settings = settings;
         m_ClearColor = settings.FallbackClearColor;
@@ -65,8 +79,13 @@ public class GenericRenderPipeline : RenderPipeline
         m_DisposalQueue = disposalQueue ?? throw new ArgumentNullException(nameof(disposalQueue));
         m_PreparedAssetProvider = preparedAssetProvider
             ?? throw new ArgumentNullException(nameof(preparedAssetProvider));
-        m_DirectionalShadowPass = new DirectionalShadowPass(assetDatabase);
+        ArgumentNullException.ThrowIfNull(features);
+        m_Features = features.Length == 0
+            ? Array.Empty<IGenericRenderPipelineFeature>()
+            : (IGenericRenderPipelineFeature[])features.Clone();
+        m_DirectionalShadowPass = new DirectionalShadowPass(assetDatabase, materialLibrary);
         m_EnvironmentSkyPass = new EnvironmentSkyPass(assetDatabase);
+        m_OutdoorAtmospherePass = new OutdoorAtmospherePass(assetDatabase);
         m_StaticMeshPass = new StaticMeshPass(assetDatabase, "GenericStaticMeshPass");
         m_TransparentStaticMeshPass = new StaticMeshPass(
             assetDatabase,
@@ -84,6 +103,12 @@ public class GenericRenderPipeline : RenderPipeline
     protected override void SetupGraph(RenderGraph graph, RenderContext context)
     {
         EnsureSmokeAssetsLoaded(context);
+        var directionalLight = GetPrimaryDirectionalLight(context);
+        var sceneEnvironment = GetSceneEnvironment(context, directionalLight);
+        var environmentTexture = EnsureEnvironmentTexture(context, sceneEnvironment);
+        var environmentLighting = EnsureEnvironmentLighting(context, environmentTexture);
+        var outdoorProfile = environmentTexture?.OutdoorProfile ?? OutdoorEnvironmentProfile.Disabled;
+        bool atmosphereEnabled = outdoorProfile.IsAtmosphereEnabled;
         var sceneColorTexture = graph.CreateTransientTexture(
             context,
             "SceneColor",
@@ -92,11 +117,17 @@ public class GenericRenderPipeline : RenderPipeline
                 context.Width,
                 context.Height,
                 EFormat.FORMAT_R16G16B16A16_SFLOAT));
-        var frameDepthDescriptor = RenderGraphTextureDescriptor.DepthAttachment2D(
-            "GenericFrameDepth",
-            context.Width,
-            context.Height,
-            EFormat.FORMAT_D32_SFLOAT);
+        var frameDepthDescriptor = atmosphereEnabled
+            ? RenderGraphTextureDescriptor.DepthAttachmentSampled2D(
+                "GenericFrameDepth",
+                context.Width,
+                context.Height,
+                EFormat.FORMAT_D32_SFLOAT)
+            : RenderGraphTextureDescriptor.DepthAttachment2D(
+                "GenericFrameDepth",
+                context.Width,
+                context.Height,
+                EFormat.FORMAT_D32_SFLOAT);
         if (IsVisualSummaryEnabled)
         {
             frameDepthDescriptor = frameDepthDescriptor.WithAdditionalUsage(
@@ -111,17 +142,19 @@ public class GenericRenderPipeline : RenderPipeline
         var directionalShadowTexture = graph.CreateTransientTexture(
             context,
             "DirectionalShadowMap",
-            RenderGraphTextureDescriptor.DepthAttachmentSampled2D(
+            RenderGraphTextureDescriptor.DepthAttachmentSampled2DArray(
                 "GenericDirectionalShadowMap",
                 m_Settings.Shadows.MapSize,
                 m_Settings.Shadows.MapSize,
-                EFormat.FORMAT_D32_SFLOAT));
+                EFormat.FORMAT_D32_SFLOAT,
+                checked((uint)m_Settings.Shadows.CascadeCount)));
         var sceneColorResource = sceneColorTexture.Resource;
         var frameDepthResource = frameDepthTexture.Resource;
         var shadowMapResource = directionalShadowTexture.Resource;
         var fallbackMaterial = m_MaterialLibrary.GetPreparedMaterial(m_MaterialLibrary.DefaultMaterialID);
         var preparedDraws = GetPreparedDraws(context);
         var cameraPosition = GetCameraPosition(context);
+        var viewProjection = GetViewProjection(context);
         PrepareCameraDrawQueues(preparedDraws, GetViewMatrix(context));
         var depthWritingDraws = new ReadOnlySpan<MeshDrawCommand>(
             m_DepthWritingDrawCommands,
@@ -131,11 +164,11 @@ public class GenericRenderPipeline : RenderPipeline
             m_TransparentDrawCommands,
             0,
             m_TransparentDrawCommandCount);
-        var directionalLight = GetPrimaryDirectionalLight(context);
-        var shadowProjection = DirectionalShadowFitter.Create(
+        Camera shadowCamera = GetShadowCamera(context);
+        DirectionalShadowCascadeSet shadowCascades = DirectionalShadowFitter.CreateCascades(
+            shadowCamera,
             directionalLight.Direction,
-            m_ShadowReceiverBounds.Bounds,
-            directionalShadowTexture.Width);
+            m_Settings.Shadows);
         ReadOnlySpan<MeshDrawCommand> preparedShadowDraws;
         if (m_Settings.Shadows.Enabled)
         {
@@ -143,27 +176,57 @@ public class GenericRenderPipeline : RenderPipeline
                 context.Device,
                 context.StaticMeshItems,
                 depthWritingDraws,
-                shadowProjection);
+                shadowCascades);
         }
         else
         {
-            ResetShadowDrawCommands();
+            ResetShadowDrawCommands(shadowCascades.Count);
             preparedShadowDraws = ReadOnlySpan<MeshDrawCommand>.Empty;
         }
-        var sceneEnvironment = GetSceneEnvironment(context, directionalLight);
-        var environmentTexture = EnsureEnvironmentTexture(context, sceneEnvironment);
-        var environmentLighting = EnsureEnvironmentLighting(context, environmentTexture);
+        m_DirectionalShadowFrameData = m_DirectionalShadowFrameBuffer.Prepare(
+            context,
+            shadowCascades,
+            directionalShadowTexture,
+            m_Settings.Shadows,
+            m_Settings.Shadows.Enabled);
+        m_EnvironmentFrameData = m_EnvironmentFrameBuffer.Prepare(
+            context,
+            sceneEnvironment,
+            directionalLight,
+            environmentTexture,
+            frameDepthTexture,
+            outdoorProfile,
+            DeviceDepthConvention.ForwardZeroToOne);
+        m_CurrentFeatureFrameContext = new GenericRenderPipelineFeatureFrameContext(
+            context,
+            viewProjection,
+            cameraPosition,
+            directionalLight,
+            sceneEnvironment,
+            m_DirectionalShadowFrameData,
+            IsVisualSummaryEnabled);
+        GenericRenderPipelineFeatureDispatcher.ConsumeExtractedFrame(
+            m_Features,
+            m_CurrentFeatureFrameContext);
+        GenericRenderPipelineFeatureDispatcher.PrepareResources(
+            m_Features,
+            m_CurrentFeatureFrameContext);
+        if (IsVisualSummaryEnabled)
+        {
+            LogShadowValidationFrame(context.FrameIndex, shadowCascades);
+        }
         int registeredMaterialCount = m_MaterialLibrary.MaterialCount;
         int preparedMaterialCount = m_MaterialLibrary.PreparedMaterialCount;
         int visibleDrawCommandCount = preparedDraws.Length;
         int shadowDrawCommandCount = preparedShadowDraws.Length;
 
-        m_DirectionalShadowPass.SetDepthTarget(
-            directionalShadowTexture.ImageView,
-            directionalShadowTexture.Format,
-            directionalShadowTexture.Width,
-            directionalShadowTexture.Height);
-        m_DirectionalShadowPass.SetProjection(shadowProjection);
+        m_DirectionalShadowPass.SetDepthTargets(
+            directionalShadowTexture,
+            shadowCascades.Count);
+        m_DirectionalShadowPass.SetCascades(
+            shadowCascades,
+            m_ShadowDrawRanges,
+            m_DirectionalShadowFrameData);
         m_DirectionalShadowPass.SetPreparedDraws(preparedShadowDraws);
         m_DirectionalShadowPass.Prepare(context);
 
@@ -178,7 +241,8 @@ public class GenericRenderPipeline : RenderPipeline
             sceneEnvironment,
             environmentLighting,
             directionalShadowTexture,
-            cameraPosition);
+            cameraPosition,
+            viewProjection);
         ConfigureStaticMeshPass(
             m_TransparentStaticMeshPass,
             context,
@@ -189,23 +253,56 @@ public class GenericRenderPipeline : RenderPipeline
             sceneEnvironment,
             environmentLighting,
             directionalShadowTexture,
-            cameraPosition);
-        m_EnvironmentSkyPass.SetEnvironment(sceneEnvironment);
-        m_EnvironmentSkyPass.SetEnvironmentTexture(environmentTexture);
+            cameraPosition,
+            viewProjection);
+        m_EnvironmentSkyPass.SetFrameData(m_EnvironmentFrameData, sceneEnvironment);
         m_EnvironmentSkyPass.SetColorTarget(
             sceneColorTexture.ImageView,
             sceneColorTexture.Format);
         m_EnvironmentSkyPass.Prepare(context);
+        if (atmosphereEnabled)
+        {
+            m_OutdoorAtmospherePass.SetFrameData(m_EnvironmentFrameData);
+            m_OutdoorAtmospherePass.SetColorTarget(
+                sceneColorTexture.ImageView,
+                sceneColorTexture.Format);
+            m_OutdoorAtmospherePass.Prepare(context);
+        }
+        if (IsVisualSummaryEnabled)
+        {
+            LogAtmosphereValidationFrame(
+                context.FrameIndex,
+                outdoorProfile,
+                m_EnvironmentFrameData.EffectiveExposure,
+                environmentLighting is { IsValid: true },
+                DeviceDepthConvention.ForwardZeroToOne);
+        }
         m_TonemapPass.SetSceneColor(
             sceneColorTexture.Image,
             sceneColorTexture.BindlessImageIndex,
             sceneColorTexture.BindlessSamplerIndex);
-        m_TonemapPass.SetExposure(sceneEnvironment.Exposure);
+        m_TonemapPass.SetExposure(m_EnvironmentFrameData.EffectiveExposure);
         m_TonemapPass.Prepare(context);
+        var featureGraphContext = new GenericRenderPipelineFeatureGraphContext(
+            graph,
+            m_CurrentFeatureFrameContext,
+            sceneColorTexture,
+            frameDepthTexture,
+            directionalShadowTexture,
+            m_DirectionalShadowFrameData,
+            m_Settings.Shadows,
+            environmentLighting);
 
         if (context.FrameIndex % 60 == 0)
         {
-            ArisenEngine.Core.Diagnostics.Logger.Log($"[GenericRenderPipeline] SetupGraph | Settings: {m_Settings.Name} | Frame: {context.FrameIndex} | Surface: 0x{context.SurfaceId:X} | Cameras: {context.CameraCount} | DirectionalLights: {context.DirectionalLightCount} | PointLights: {context.PointLightCount} | SpotLights: {context.SpotLightCount} | Environments: {context.SceneEnvironmentCount} | EnvironmentTexture: {(environmentTexture is { IsValid: true } ? environmentTexture.Asset.Name : "ProceduralFallback")} | EnvironmentIBL: {(environmentLighting is { IsValid: true } ? $"Ready (irr={environmentLighting.IrradianceImageIndex}, spec={environmentLighting.PrefilteredSpecularImageIndex}, brdf={environmentLighting.BrdfIntegrationLutImageIndex})" : "Unavailable")} | Materials: {preparedMaterialCount}/{registeredMaterialCount} prepared | LegacyDraws: {context.DrawListCount} | SceneItems: {m_StaticMeshCullingStats.SourceItemCount} | VisibleItems: {m_StaticMeshCullingStats.VisibleItemCount} | CulledItems: {m_StaticMeshCullingStats.CulledItemCount} | VisibleDrawCommands: {visibleDrawCommandCount} | OpaqueDraws: {m_OpaqueDrawCommandCount} | AlphaTestDraws: {m_AlphaTestDrawCommandCount} | TransparentDraws: {m_TransparentDrawCommandCount} | SkippedAlphaDraws: {m_SkippedAlphaDrawCommandCount} | ShadowCasters: {m_ShadowCasterCullingStats.VisibleItemCount} | ShadowCulled: {m_ShadowCasterCullingStats.CulledItemCount} | ShadowDrawCommands: {shadowDrawCommandCount} | ShadowFit: {(shadowProjection.IsSceneFitted ? "Scene" : "ShowcaseFallback")} | SceneColor: {sceneColorTexture.Width}x{sceneColorTexture.Height} {sceneColorTexture.Format} | FrameDepth: {frameDepthTexture.Width}x{frameDepthTexture.Height} {frameDepthTexture.Format} | ShadowMap: {directionalShadowTexture.Width}x{directionalShadowTexture.Height} {directionalShadowTexture.Format} | ClearColorFallback: {m_ClearColor}");
+            ArisenEngine.Core.Diagnostics.Logger.Log($"[GenericRenderPipeline] SetupGraph | Settings: {m_Settings.Name} | Frame: {context.FrameIndex} | Surface: 0x{context.SurfaceId:X} | Cameras: {context.CameraCount} | DirectionalLights: {context.DirectionalLightCount} | PointLights: {context.PointLightCount} | SpotLights: {context.SpotLightCount} | Environments: {context.SceneEnvironmentCount} | EnvironmentTexture: {(environmentTexture is { IsValid: true } ? environmentTexture.Asset.Name : "ProceduralFallback")} | EnvironmentSkyMode: {outdoorProfile.SkyMode} | Atmosphere: {(atmosphereEnabled ? "Enabled" : "Disabled")} | EffectiveExposure: {m_EnvironmentFrameData.EffectiveExposure:0.###} | EnvironmentIBL: {(environmentLighting is { IsValid: true } ? $"Ready (irr={environmentLighting.IrradianceImageIndex}, spec={environmentLighting.PrefilteredSpecularImageIndex}, brdf={environmentLighting.BrdfIntegrationLutImageIndex})" : "Unavailable")} | Materials: {preparedMaterialCount}/{registeredMaterialCount} prepared | LegacyDraws: {context.DrawListCount} | SceneItems: {m_StaticMeshCullingStats.SourceItemCount} | VisibleItems: {m_StaticMeshCullingStats.VisibleItemCount} | CulledItems: {m_StaticMeshCullingStats.CulledItemCount} | VisibleDrawCommands: {visibleDrawCommandCount} | OpaqueDraws: {m_OpaqueDrawCommandCount} | AlphaTestDraws: {m_AlphaTestDrawCommandCount} | TransparentDraws: {m_TransparentDrawCommandCount} | SkippedAlphaDraws: {m_SkippedAlphaDrawCommandCount} | ShadowCasters: {m_ShadowCasterCullingStats.VisibleItemCount} | ShadowCulled: {m_ShadowCasterCullingStats.CulledItemCount} | ShadowDrawCommands: {shadowDrawCommandCount} | ShadowDropped: {m_DroppedShadowDrawCommandCount} | ShadowCascades: {shadowCascades.Count} | SceneColor: {sceneColorTexture.Width}x{sceneColorTexture.Height} {sceneColorTexture.Format} | FrameDepth: {frameDepthTexture.Width}x{frameDepthTexture.Height} {frameDepthTexture.Format} | ShadowMap: {directionalShadowTexture.Width}x{directionalShadowTexture.Height}x{directionalShadowTexture.ArrayLayers} {directionalShadowTexture.Format} | ClearColorFallback: {m_ClearColor}");
+            if (m_DroppedShadowDrawCommandCount > 0)
+            {
+                ArisenEngine.Core.Diagnostics.Logger.Warning(
+                    $"[GenericRenderPipeline] Directional shadow draw budget exhausted | " +
+                    $"Capacity: {MaximumDirectionalShadowDrawCommands} | " +
+                    $"Dropped: {m_DroppedShadowDrawCommandCount}.");
+            }
         }
 
         Profiler.PlotValue("Render.MaterialCount", registeredMaterialCount);
@@ -218,6 +315,11 @@ public class GenericRenderPipeline : RenderPipeline
         Profiler.PlotValue("Render.EnvironmentIBLEnabled", environmentLighting is { IsValid: true } ? 1 : 0);
         Profiler.PlotValue("Render.EnvironmentSpecularMaxLod", environmentLighting?.PrefilteredSpecularMaxLod ?? 0.0f);
         Profiler.PlotValue("Render.SceneExposure", sceneEnvironment.Exposure);
+        Profiler.PlotValue("Render.EnvironmentEffectiveExposure", m_EnvironmentFrameData.EffectiveExposure);
+        Profiler.PlotValue("Render.EnvironmentSkyMode", (double)(int)outdoorProfile.SkyMode);
+        Profiler.PlotValue("Render.AtmosphereEnabled", atmosphereEnabled ? 1 : 0);
+        Profiler.PlotValue("Render.AerialPerspectiveEnabled", outdoorProfile.AerialPerspectiveEnabled ? 1 : 0);
+        Profiler.PlotValue("Render.HeightFogEnabled", outdoorProfile.HeightFogEnabled ? 1 : 0);
         Profiler.PlotValue("Render.VisibleDrawCommandCount", visibleDrawCommandCount);
         Profiler.PlotValue("Render.OpaqueDrawCommandCount", m_OpaqueDrawCommandCount);
         Profiler.PlotValue("Render.AlphaTestDrawCommandCount", m_AlphaTestDrawCommandCount);
@@ -227,7 +329,8 @@ public class GenericRenderPipeline : RenderPipeline
         Profiler.PlotValue("Render.ShadowCasterItemCount", m_ShadowCasterCullingStats.VisibleItemCount);
         Profiler.PlotValue("Render.CulledShadowCasterItemCount", m_ShadowCasterCullingStats.CulledItemCount);
         Profiler.PlotValue("Render.ShadowCasterDrawCommandCount", shadowDrawCommandCount);
-        Profiler.PlotValue("Render.ShadowSceneFitted", shadowProjection.IsSceneFitted ? 1 : 0);
+        Profiler.PlotValue("Render.ShadowCascadeCount", shadowCascades.Count);
+        Profiler.PlotValue("Render.DroppedShadowDrawCommandCount", m_DroppedShadowDrawCommandCount);
         Profiler.PlotValue("Render.SceneColor.Width", sceneColorTexture.Width);
         Profiler.PlotValue("Render.SceneColor.Height", sceneColorTexture.Height);
         Profiler.PlotValue("Render.SceneColor.Format", (double)(uint)sceneColorTexture.Format);
@@ -247,6 +350,10 @@ public class GenericRenderPipeline : RenderPipeline
             builder => builder.WriteDepthAttachment(
                 shadowMapResource,
                 RenderAttachmentIntent.ClearStore));
+        GenericRenderPipelineFeatureDispatcher.AddRenderGraphPasses(
+            m_Features,
+            GenericRenderPipelineFeatureGraphStage.DirectionalShadow,
+            featureGraphContext);
 
         // 2. The environment sky initializes and fills the HDR scene color target.
         graph.AddPass(
@@ -267,6 +374,10 @@ public class GenericRenderPipeline : RenderPipeline
                 .ReadWriteDepthAttachment(
                     frameDepthResource,
                     RenderAttachmentIntent.ClearThenLoadStore));
+        GenericRenderPipelineFeatureDispatcher.AddRenderGraphPasses(
+            m_Features,
+            GenericRenderPipelineFeatureGraphStage.Opaque,
+            featureGraphContext);
 
         // 4. Transparent meshes preserve sorted order, test opaque depth, and never write it.
         m_TransparentStaticMeshPass.Prepare(context);
@@ -281,7 +392,19 @@ public class GenericRenderPipeline : RenderPipeline
                     frameDepthResource,
                     RenderAttachmentIntent.ReadOnlyLoadStore));
 
-        // 5. Tonemap scene color into the active presentation target.
+        // 5. Optional atmosphere samples graph-owned depth and blends into HDR scene color.
+        if (atmosphereEnabled)
+        {
+            graph.AddPass(
+                m_OutdoorAtmospherePass,
+                builder => builder
+                    .ReadShader(frameDepthResource)
+                    .ReadWriteColorAttachment(
+                        sceneColorResource,
+                        RenderAttachmentIntent.LoadStore));
+        }
+
+        // 6. Tonemap scene color into the active presentation target.
         graph.AddPass(
             m_TonemapPass,
             builder => builder
@@ -301,7 +424,8 @@ public class GenericRenderPipeline : RenderPipeline
         SceneEnvironment sceneEnvironment,
         RHIEnvironmentLightingResource? environmentLighting,
         RenderGraphTexture directionalShadowTexture,
-        Vector3 cameraPosition)
+        Vector3 cameraPosition,
+        Matrix4x4 viewProjection)
     {
         pass.SetColorTarget(sceneColorTexture.ImageView, sceneColorTexture.Format);
         pass.SetDepthTarget(
@@ -311,19 +435,12 @@ public class GenericRenderPipeline : RenderPipeline
             frameDepthTexture.Height);
         m_MaterialLibrary.ApplyMaterialSlots(pass);
         pass.SetPreparedDraws(preparedDraws);
-        pass.SetViewProjection(GetViewProjection(context));
+        pass.SetViewProjection(viewProjection);
         pass.SetCameraPosition(cameraPosition);
         pass.SetPointLights(context.PointLights);
         pass.SetSpotLights(context.SpotLights);
         pass.SetDirectionalShadow(
-            m_DirectionalShadowPass.ViewProjection,
-            directionalShadowTexture.BindlessImageIndex,
-            directionalShadowTexture.BindlessSamplerIndex,
-            1.0f / directionalShadowTexture.Width,
-            m_Settings.Shadows.DepthBias,
-            m_Settings.Shadows.SlopeBias,
-            m_Settings.Shadows.Strength,
-            m_Settings.Shadows.PcfRadius,
+            m_DirectionalShadowFrameData,
             m_Settings.Shadows.Enabled && m_DirectionalShadowPass.HasRenderableShadowMap);
         pass.SetDirectionalLight(directionalLight);
         pass.SetSceneEnvironment(sceneEnvironment);
@@ -335,9 +452,24 @@ public class GenericRenderPipeline : RenderPipeline
     {
         m_AssetDatabase.AssetChanged -= OnAssetChanged;
         WaitForLastSubmittedFrame();
-        m_DisposalQueue.Drain(m_LastDevice);
+        GenericRenderPipelineFeatureDispatcher.ReleaseDeviceResources(m_Features);
+        if (m_LastDevice.IsValid)
+        {
+            m_DisposalQueue.Drain(
+                m_LastDevice,
+                m_DeviceGeneration,
+                m_LastSubmittedTicket);
+        }
+        else if (m_DisposalQueue.PendingCount != 0)
+        {
+            throw new InvalidOperationException(
+                $"GenericRP has {m_DisposalQueue.PendingCount} deferred resources without a bound RHI device.");
+        }
         m_DirectionalShadowPass.Dispose();
+        m_DirectionalShadowFrameBuffer.Dispose();
+        m_EnvironmentFrameBuffer.Dispose();
         m_EnvironmentSkyPass.Dispose();
+        m_OutdoorAtmospherePass.Dispose();
         m_TransparentStaticMeshPass.Dispose();
         m_StaticMeshPass.Dispose();
         m_TonemapPass.Dispose();
@@ -355,7 +487,15 @@ public class GenericRenderPipeline : RenderPipeline
     {
         m_LastSubmittedTicket = submittedTicket;
         m_PreparedAssetProvider.UpdateSubmittedTicket(submittedTicket);
-        m_DisposalQueue.ReleaseCompleted(context.Device);
+        m_DisposalQueue.ReleaseCompleted(
+            context.Device,
+            context.DeviceGeneration);
+        var featureSubmissionContext = new GenericRenderPipelineFeatureSubmissionContext(
+            m_CurrentFeatureFrameContext,
+            submittedTicket);
+        GenericRenderPipelineFeatureDispatcher.OnFrameSubmitted(
+            m_Features,
+            featureSubmissionContext);
     }
 
     private void OnAssetChanged(AssetChangeEvent change)
@@ -367,7 +507,12 @@ public class GenericRenderPipeline : RenderPipeline
     {
         var device = context.Device;
         m_LastDevice = device;
-        m_PreparedAssetProvider.UpdateFrameContext(device, m_LastSubmittedTicket);
+        m_DeviceGeneration = context.DeviceGeneration;
+        m_DisposalQueue.BindDevice(device, m_DeviceGeneration);
+        m_LastSubmittedTicket = m_PreparedAssetProvider.UpdateFrameContext(
+            device,
+            m_DeviceGeneration,
+            m_LastSubmittedTicket);
 
         var dirtyGuids = m_ReloadQueue.Drain();
         if (dirtyGuids.Length > 0)
@@ -696,63 +841,103 @@ public class GenericRenderPipeline : RenderPipeline
         RHIDevice device,
         ReadOnlySpan<StaticMeshRenderItem> items,
         ReadOnlySpan<MeshDrawCommand> cameraVisibleDraws,
-        DirectionalShadowProjection projection)
+        DirectionalShadowCascadeSet cascades)
     {
         m_ShadowDrawCommandCount = 0;
+        m_DroppedShadowDrawCommandCount = 0;
+        Span<DirectionalShadowCascadeDrawRange> ranges =
+            stackalloc DirectionalShadowCascadeDrawRange[4];
+        int cascadeCount = cascades.Count;
         if (items.IsEmpty)
         {
-            m_ShadowCasterCullingStats = new StaticMeshCullingStats(0, 0, 0);
-            PlotShadowCasterCullingDiagnostics(cameraVisibleDraws.Length);
-            return cameraVisibleDraws;
-        }
+            EnsureDrawCapacity(
+                ref m_ShadowDrawCommands,
+                Math.Min(
+                    MaximumDirectionalShadowDrawCommands,
+                    checked(cameraVisibleDraws.Length * cascadeCount)));
+            for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
+            {
+                int rangeStart = m_ShadowDrawCommandCount;
+                int remaining = MaximumDirectionalShadowDrawCommands - rangeStart;
+                int accepted = Math.Min(cameraVisibleDraws.Length, Math.Max(0, remaining));
+                cameraVisibleDraws.Slice(0, accepted).CopyTo(
+                    m_ShadowDrawCommands.AsSpan(rangeStart, accepted));
+                m_ShadowDrawCommandCount += accepted;
+                m_DroppedShadowDrawCommandCount += cameraVisibleDraws.Length - accepted;
+                ranges[cascadeIndex] = new DirectionalShadowCascadeDrawRange(
+                    rangeStart,
+                    accepted);
+            }
 
-        if (!projection.IsSceneFitted)
-        {
-            m_ShadowCasterCullingStats = m_StaticMeshCullingStats;
-            PlotShadowCasterCullingDiagnostics(cameraVisibleDraws.Length);
-            return cameraVisibleDraws;
+            m_ShadowCasterCullingStats = new StaticMeshCullingStats(
+                checked(cameraVisibleDraws.Length * cascadeCount),
+                m_ShadowDrawCommandCount,
+                0);
+            FinalizeShadowDrawRanges(cascadeCount, ranges);
+            PlotShadowCasterCullingDiagnostics(m_ShadowDrawCommandCount);
+            return new ReadOnlySpan<MeshDrawCommand>(
+                m_ShadowDrawCommands,
+                0,
+                m_ShadowDrawCommandCount);
         }
 
         int visibleItemCount = 0;
         int culledItemCount = 0;
-        for (int i = 0; i < items.Length; i++)
+        for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
         {
-            ref readonly var item = ref items[i];
-            if (!item.IsValid)
+            int rangeStart = m_ShadowDrawCommandCount;
+            DirectionalShadowCascade cascade = cascades.GetCascade(cascadeIndex);
+            for (int itemIndex = 0; itemIndex < items.Length; itemIndex++)
             {
-                continue;
+                ref readonly StaticMeshRenderItem item = ref items[itemIndex];
+                if (!item.IsValid)
+                {
+                    continue;
+                }
+
+                RHIStaticMeshResource mesh = GetOrCreateSceneMesh(device, item.MeshGuid);
+                if (mesh is not { IsValid: true })
+                {
+                    continue;
+                }
+
+                if (StaticMeshFrustumCuller.TryGetWorldBounds(
+                        item,
+                        mesh.Bounds,
+                        out MeshBounds worldBounds) &&
+                    !StaticMeshFrustumCuller.IsVisible(
+                        DirectionalShadowCoordinateSpace.ToCameraRelative(
+                            worldBounds,
+                            cascades.CameraPosition),
+                        cascade.ViewProjection))
+                {
+                    culledItemCount++;
+                    continue;
+                }
+
+                visibleItemCount++;
+                int firstAppendedDraw = m_ShadowDrawCommandCount;
+                int appendedDrawEnd = AppendShadowItemDrawCommands(
+                    item,
+                    mesh,
+                    out int droppedDrawCount);
+                m_DroppedShadowDrawCommandCount += droppedDrawCount;
+                m_ShadowDrawCommandCount = CompactDepthWritingDrawCommands(
+                    m_ShadowDrawCommands,
+                    firstAppendedDraw,
+                    appendedDrawEnd);
             }
 
-            var mesh = GetOrCreateSceneMesh(device, item.MeshGuid);
-            if (mesh is not { IsValid: true })
-            {
-                continue;
-            }
-
-            if (StaticMeshFrustumCuller.TryGetWorldBounds(item, mesh.Bounds, out var worldBounds) &&
-                !StaticMeshFrustumCuller.IsVisible(worldBounds, projection.ViewProjection))
-            {
-                culledItemCount++;
-                continue;
-            }
-
-            visibleItemCount++;
-            int firstAppendedDraw = m_ShadowDrawCommandCount;
-            int appendedDrawEnd = AppendItemDrawCommands(
-                ref m_ShadowDrawCommands,
-                m_ShadowDrawCommandCount,
-                item,
-                mesh);
-            m_ShadowDrawCommandCount = CompactDepthWritingDrawCommands(
-                m_ShadowDrawCommands,
-                firstAppendedDraw,
-                appendedDrawEnd);
+            ranges[cascadeIndex] = new DirectionalShadowCascadeDrawRange(
+                rangeStart,
+                m_ShadowDrawCommandCount - rangeStart);
         }
 
         m_ShadowCasterCullingStats = new StaticMeshCullingStats(
-            items.Length,
+            checked(items.Length * cascadeCount),
             visibleItemCount,
             culledItemCount);
+        FinalizeShadowDrawRanges(cascadeCount, ranges);
         PlotShadowCasterCullingDiagnostics(m_ShadowDrawCommandCount);
         return new ReadOnlySpan<MeshDrawCommand>(
             m_ShadowDrawCommands,
@@ -839,11 +1024,89 @@ public class GenericRenderPipeline : RenderPipeline
         Profiler.PlotValue("Render.ShadowCasterDrawCommandCount", drawCommandCount);
     }
 
-    private void ResetShadowDrawCommands()
+    private void ResetShadowDrawCommands(int cascadeCount)
     {
         m_ShadowDrawCommandCount = 0;
+        m_DroppedShadowDrawCommandCount = 0;
         m_ShadowCasterCullingStats = default;
+        m_ShadowDrawRanges = new DirectionalShadowCascadeDrawRangeSet(
+            cascadeCount,
+            0,
+            0,
+            default,
+            default,
+            default,
+            default);
         PlotShadowCasterCullingDiagnostics(0);
+    }
+
+    private int AppendShadowItemDrawCommands(
+        in StaticMeshRenderItem item,
+        RHIStaticMeshResource mesh,
+        out int droppedDrawCount)
+    {
+        droppedDrawCount = 0;
+        int firstSubmeshIndex = Math.Max(0, item.FirstSubmeshIndex);
+        if (firstSubmeshIndex >= mesh.SubmeshCount)
+        {
+            return m_ShadowDrawCommandCount;
+        }
+
+        int availableSubmeshes = mesh.SubmeshCount - firstSubmeshIndex;
+        int requestedSubmeshes = item.SubmeshCount < 0
+            ? availableSubmeshes
+            : Math.Min(item.SubmeshCount, availableSubmeshes);
+        if (requestedSubmeshes <= 0)
+        {
+            return m_ShadowDrawCommandCount;
+        }
+
+        int remainingCapacity = Math.Max(
+            0,
+            MaximumDirectionalShadowDrawCommands - m_ShadowDrawCommandCount);
+        int acceptedSubmeshes = Math.Min(requestedSubmeshes, remainingCapacity);
+        droppedDrawCount = requestedSubmeshes - acceptedSubmeshes;
+        if (acceptedSubmeshes == 0)
+        {
+            return m_ShadowDrawCommandCount;
+        }
+
+        EnsureDrawCapacity(
+            ref m_ShadowDrawCommands,
+            m_ShadowDrawCommandCount + acceptedSubmeshes);
+        Span<MeshDrawCommand> destination = new(
+            m_ShadowDrawCommands,
+            m_ShadowDrawCommandCount,
+            acceptedSubmeshes);
+        uint materialId = ResolveMaterialId(item.MaterialGuid);
+        int written = item.MaterialGuid == Guid.Empty
+            ? mesh.CreateDrawCommands(
+                destination,
+                item.LocalToWorld,
+                materialId,
+                firstSubmeshIndex,
+                acceptedSubmeshes)
+            : mesh.CreateDrawCommandsWithMaterialOverride(
+                destination,
+                item.LocalToWorld,
+                materialId,
+                firstSubmeshIndex,
+                acceptedSubmeshes);
+        return m_ShadowDrawCommandCount + written;
+    }
+
+    private void FinalizeShadowDrawRanges(
+        int cascadeCount,
+        ReadOnlySpan<DirectionalShadowCascadeDrawRange> ranges)
+    {
+        m_ShadowDrawRanges = new DirectionalShadowCascadeDrawRangeSet(
+            cascadeCount,
+            m_ShadowDrawCommandCount,
+            m_DroppedShadowDrawCommandCount,
+            ranges[0],
+            ranges[1],
+            ranges[2],
+            ranges[3]);
     }
 
     private int AppendItemDrawCommands(
@@ -1054,6 +1317,67 @@ public class GenericRenderPipeline : RenderPipeline
         return false;
     }
 
+    private void LogShadowValidationFrame(
+        uint frameIndex,
+        in DirectionalShadowCascadeSet cascades)
+    {
+        KernelLog.InfoFormat(
+            "[GenericRP.ShadowValidation] Frame={0} Cascades={1} " +
+            "MeshDraws={2},{3},{4},{5} Dropped={6} " +
+            "SplitFar={7:F6},{8:F6},{9:F6},{10:F6}",
+            frameIndex,
+            cascades.Count,
+            GetCascadeDrawCount(m_ShadowDrawRanges, 0),
+            GetCascadeDrawCount(m_ShadowDrawRanges, 1),
+            GetCascadeDrawCount(m_ShadowDrawRanges, 2),
+            GetCascadeDrawCount(m_ShadowDrawRanges, 3),
+            m_ShadowDrawRanges.DroppedDrawCount,
+            GetCascadeSplitFar(cascades, 0),
+            GetCascadeSplitFar(cascades, 1),
+            GetCascadeSplitFar(cascades, 2),
+            GetCascadeSplitFar(cascades, 3));
+    }
+
+    private static void LogAtmosphereValidationFrame(
+        uint frameIndex,
+        in OutdoorEnvironmentProfile profile,
+        float effectiveExposure,
+        bool environmentIblReady,
+        DeviceDepthConvention depthConvention)
+    {
+        KernelLog.InfoFormat(
+            "[GenericRP.AtmosphereValidation] Frame={0} SkyMode={1} " +
+            "Atmosphere={2} Aerial={3} HeightFog={4} ExposurePolicy={5} " +
+            "Exposure={6:F6} Depth={7} IBL={8} SunCoupling={9:F6} " +
+            "AerialStart={10:F6} AerialDistance={11:F6} AerialStrength={12:F6} " +
+            "FogDensity={13:F6} FogFalloff={14:F6}",
+            frameIndex,
+            profile.SkyMode,
+            profile.IsAtmosphereEnabled ? 1 : 0,
+            profile.AerialPerspectiveEnabled ? 1 : 0,
+            profile.HeightFogEnabled ? 1 : 0,
+            profile.ExposurePolicy,
+            effectiveExposure,
+            depthConvention,
+            environmentIblReady ? 1 : 0,
+            profile.SunSkyCoupling,
+            profile.AerialStartDistance,
+            profile.AerialDistance,
+            profile.AerialStrength,
+            profile.HeightFogDensity,
+            profile.HeightFogFalloff);
+    }
+
+    private static int GetCascadeDrawCount(
+        in DirectionalShadowCascadeDrawRangeSet ranges,
+        int cascadeIndex) =>
+        cascadeIndex < ranges.Count ? ranges.GetRange(cascadeIndex).Count : 0;
+
+    private static float GetCascadeSplitFar(
+        in DirectionalShadowCascadeSet cascades,
+        int cascadeIndex) =>
+        cascadeIndex < cascades.Count ? cascades.GetCascade(cascadeIndex).SplitFar : 0.0f;
+
     private static Matrix4x4 GetViewProjection(RenderContext context)
     {
         if (context.CameraCount <= 0)
@@ -1081,6 +1405,28 @@ public class GenericRenderPipeline : RenderPipeline
         }
 
         return context.Cameras[0].Position;
+    }
+
+    private Camera GetShadowCamera(RenderContext context)
+    {
+        if (context.CameraCount > 0)
+        {
+            return context.Cameras[0];
+        }
+
+        return new Camera
+        {
+            FieldOfView = 60.0f,
+            NearClip = 0.1f,
+            FarClip = MathF.Max(1.0f, m_Settings.Shadows.MaximumDistance),
+            AspectRatio = context.Height > 0
+                ? context.Width / (float)context.Height
+                : 1.0f,
+            OrthographicSize = 5.0f,
+            ProjectionType = CameraProjectionType.Perspective,
+            Position = Vector3.Zero,
+            Rotation = Vector3.Zero
+        };
     }
 
     private static DirectionalLight GetPrimaryDirectionalLight(RenderContext context)

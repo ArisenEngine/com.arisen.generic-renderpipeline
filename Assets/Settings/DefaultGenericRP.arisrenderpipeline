@@ -1,5 +1,5 @@
 # Project-facing quality values. Render-pass topology remains code-owned by Generic RP.
-Version: 1
+Version: 2
 Pipeline: GenericRP
 Name: Generic RP Default
 Fallback:
@@ -16,3 +16,10 @@ Shadows:
   SlopeBias: 0.00231
   Strength: 0.78
   PcfRadius: 1
+  # Outdoor cascades share one depth-array allocation at this per-layer resolution.
+  CascadeCount: 4
+  MaximumDistance: 250.0
+  # Blend between uniform (0) and logarithmic (1) camera-depth splits.
+  PracticalSplitWeight: 0.65
+  # Fade the final cascade over the terminal fraction of MaximumDistance.
+  TerminalFadeFraction: 0.10

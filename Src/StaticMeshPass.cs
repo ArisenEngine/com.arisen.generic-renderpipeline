@@ -220,12 +220,12 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
                 $"[StaticMeshPass] RecordFallback | Surface: 0x{context.SurfaceId:X} | Size: {context.Width}x{context.Height} | Pipeline: {pipelineBatch.Pipeline.Index}:{pipelineBatch.Pipeline.Generation}");
         }
 
+        RecordObjectDataBarrier(commandList);
         BeginStaticMeshRendering(
             context,
             commandList,
             colorImageView,
             clearDepth: m_Configuration.ClearDepthOnFirstWorkItem);
-        RecordObjectDataBarrier(commandList);
 
         commandList.BindPipeline(pipelineBatch.Pipeline);
         commandList.PushConstants(
@@ -296,12 +296,12 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         var drawIndexEnd = Math.Min(m_BatchedDrawIndices.Length, workItem.DrawIndexStart + workItem.DrawIndexCount);
         var colorImageView = GetColorTargetImageView(context);
 
+        RecordObjectDataBarrier(commandList);
         BeginStaticMeshRendering(
             context,
             commandList,
             colorImageView,
             clearDepth: firstWorkItem && m_Configuration.ClearDepthOnFirstWorkItem);
-        RecordObjectDataBarrier(commandList);
 
         commandList.BindPipeline(pipelineBatch.Pipeline);
         commandList.SetViewport(0, 0, context.Width, context.Height);
@@ -487,7 +487,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             var key = new StaticMeshPipelineKey(
                 slot.Shader.Guid,
                 slot.ShaderDependencyStamp,
-                slot.Shader.GetVariantIdentity(),
+                slot.PipelineSignature.ShaderVariantIdentity,
                 slot.RenderState,
                 m_Configuration.DepthWriteEnabled,
                 colorFormat,
@@ -523,7 +523,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             Array.Resize(ref m_PipelineBatches, Math.Max(4, m_PipelineBatches.Length * 2));
         }
 
-        var batch = new StaticMeshPipelineBatch(key, shader);
+        var batch = new StaticMeshPipelineBatch(key, shader, pipelineCache);
 
         try
         {
@@ -883,21 +883,32 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             ? m_MaterialSlots[slotIndex].PipelineBatchIndex
             : -1;
         var renderQueue = RenderQueuePolicy.Resolve(material.RenderState, material.Shader.VariantKeywords);
+        var pipelineSignature = new StaticMeshMaterialPipelineSignature(
+            material.Shader.Guid,
+            material.ShaderDependencyStamp,
+            material.ShaderVariantIdentity,
+            material.RenderState,
+            renderQueue);
         var slot = new StaticMeshMaterialSlot(
             material.Shader,
-            material.ShaderDependencyStamp,
-            material.RenderState,
-            renderQueue,
+            pipelineSignature,
             CreateMaterialConstants(material),
             previousPipelineBatchIndex);
 
-        if (m_MaterialSlots[slotIndex].Equals(slot))
+        var previousSlot = m_MaterialSlots[slotIndex];
+        if (previousSlot.Equals(slot))
         {
             return;
         }
 
         m_MaterialSlots[slotIndex] = slot;
-        m_MaterialSlotVersion++;
+        if (StaticMeshMaterialPipelinePolicy.RequiresPipelineRebuild(
+                previousSlot.IsValid,
+                previousSlot.PipelineSignature,
+                slot.PipelineSignature))
+        {
+            m_MaterialSlotVersion++;
+        }
     }
 
     public void SetViewProjection(Matrix4x4 viewProjection)
@@ -963,26 +974,12 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     }
 
     public void SetDirectionalShadow(
-        Matrix4x4 shadowViewProjection,
-        uint shadowImageIndex,
-        uint shadowSamplerIndex,
-        float texelSize,
-        float depthBias,
-        float slopeBias,
-        float strength,
-        int pcfRadius,
+        in DirectionalShadowFrameData frameData,
         bool enabled)
     {
-        m_ShadowViewProjection = shadowViewProjection;
         m_ShadowConstants = StaticMeshShadowConstants.From(
-            shadowImageIndex,
-            shadowSamplerIndex,
-            texelSize,
-            depthBias,
-            slopeBias,
-            strength,
-            pcfRadius,
-            enabled);
+            frameData.ConstantsBufferBindlessIndex,
+            enabled && frameData.Enabled);
     }
 
     public void SetFallbackLocalToWorld(Matrix4x4 localToWorld)
@@ -1078,7 +1075,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         }
 
         EnsureObjectDataRing(factory, GetObjectDataRingSize(context));
-        m_ObjectDataSlotIndex = checked((int)(context.FrameIndex % (uint)m_ObjectDataRingSize));
+        m_ObjectDataSlotIndex = checked((int)(context.FrameResourceIndex % (uint)m_ObjectDataRingSize));
 
         EnsureObjectDataCapacity(sceneDataCount);
         if (m_PreparedDrawCount > 0)
@@ -1311,6 +1308,12 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
 
     private void ReleasePipelineBatchResources(ref StaticMeshPipelineBatch batch)
     {
+        if (batch.Pipeline.IsValid && batch.PipelineCache is not null)
+        {
+            batch.PipelineCache.ReleasePipeline(batch.Pipeline);
+        }
+        batch.Pipeline = RHIPipelineHandle.Invalid;
+
         if (batch.PipelineState.IsValid)
         {
             batch.PipelineState.Release();
@@ -1344,7 +1347,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         batch.FragmentProgram = RHIShaderProgramHandle.Invalid;
         batch.VertexShaderAsset = CookedAssetHandle.Invalid;
         batch.FragmentShaderAsset = CookedAssetHandle.Invalid;
-        batch.Pipeline = RHIPipelineHandle.Invalid;
+        batch.PipelineCache = null;
         batch.Key = default;
         batch.Shader = null;
     }
@@ -1374,7 +1377,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
                (((uint)spotLightCount & 0xFFFFu) << 16);
     }
 
-    private static StaticMeshMaterialConstants CreateMaterialConstants(RHIMaterialResource material)
+    internal static StaticMeshMaterialConstants CreateMaterialConstants(RHIMaterialResource material)
     {
         var baseColorTexture = material.GetTexture2DConstants(MaterialTextureSlots.BaseColor);
         var normalTexture = material.TryGetTexture2DConstants(MaterialTextureSlots.Normal, out var normalConstants)
@@ -1561,6 +1564,7 @@ internal struct StaticMeshPipelineBatch
 {
     public StaticMeshPipelineKey Key;
     public ShaderAsset? Shader;
+    public RHIPipelineCache? PipelineCache;
     public RHIPipelineState PipelineState;
     public RHIPipelineHandle Pipeline;
     public RHIShaderProgramHandle VertexProgram;
@@ -1569,10 +1573,14 @@ internal struct StaticMeshPipelineBatch
     public CookedAssetHandle FragmentShaderAsset;
     public bool IsValid => Pipeline.IsValid;
 
-    public StaticMeshPipelineBatch(StaticMeshPipelineKey key, ShaderAsset shader)
+    public StaticMeshPipelineBatch(
+        StaticMeshPipelineKey key,
+        ShaderAsset shader,
+        RHIPipelineCache pipelineCache)
     {
         Key = key;
         Shader = shader;
+        PipelineCache = pipelineCache;
         PipelineState = default;
         Pipeline = RHIPipelineHandle.Invalid;
         VertexProgram = RHIShaderProgramHandle.Invalid;
@@ -1718,25 +1726,22 @@ internal readonly struct StaticMeshObjectBufferSlot
 internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
 {
     public readonly ShaderAsset? Shader;
-    public readonly AssetDependencyStamp ShaderDependencyStamp;
-    public readonly MaterialRenderState RenderState;
-    public readonly RenderQueueInfo RenderQueue;
+    public readonly StaticMeshMaterialPipelineSignature PipelineSignature;
+    public AssetDependencyStamp ShaderDependencyStamp => PipelineSignature.ShaderDependencyStamp;
+    public MaterialRenderState RenderState => PipelineSignature.RenderState;
+    public RenderQueueInfo RenderQueue => PipelineSignature.RenderQueue;
     public readonly StaticMeshMaterialConstants Constants;
     public int PipelineBatchIndex;
     public readonly bool IsValid;
 
     public StaticMeshMaterialSlot(
         ShaderAsset shader,
-        AssetDependencyStamp shaderDependencyStamp,
-        MaterialRenderState renderState,
-        RenderQueueInfo renderQueue,
+        StaticMeshMaterialPipelineSignature pipelineSignature,
         StaticMeshMaterialConstants constants,
         int pipelineBatchIndex)
     {
         Shader = shader;
-        ShaderDependencyStamp = shaderDependencyStamp;
-        RenderState = renderState;
-        RenderQueue = renderQueue;
+        PipelineSignature = pipelineSignature;
         Constants = constants;
         PipelineBatchIndex = pipelineBatchIndex;
         IsValid = true;
@@ -1746,9 +1751,7 @@ internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
     {
         return IsValid == other.IsValid &&
                ReferenceEquals(Shader, other.Shader) &&
-               ShaderDependencyStamp == other.ShaderDependencyStamp &&
-               RenderState == other.RenderState &&
-               RenderQueue == other.RenderQueue &&
+               PipelineSignature == other.PipelineSignature &&
                Constants.Equals(other.Constants) &&
                PipelineBatchIndex == other.PipelineBatchIndex;
     }
@@ -1762,9 +1765,7 @@ internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
     {
         return HashCode.Combine(
             Shader,
-            ShaderDependencyStamp,
-            RenderState,
-            RenderQueue,
+            PipelineSignature,
             Constants,
             PipelineBatchIndex,
             IsValid);
@@ -2037,22 +2038,14 @@ internal readonly struct StaticMeshShadowConstants
     }
 
     public static StaticMeshShadowConstants From(
-        uint shadowImageIndex,
-        uint shadowSamplerIndex,
-        float texelSize,
-        float depthBias,
-        float slopeBias,
-        float strength,
-        int pcfRadius,
+        uint shadowBufferIndex,
         bool enabled)
     {
         bool isEnabled = enabled &&
-                         shadowImageIndex != InvalidBindlessIndex &&
-                         shadowSamplerIndex != InvalidBindlessIndex &&
-                         texelSize > 0.0f;
+                         shadowBufferIndex != InvalidBindlessIndex;
         return new StaticMeshShadowConstants(
-            new Vector4(shadowImageIndex, shadowSamplerIndex, pcfRadius, slopeBias),
-            new Vector4(depthBias, strength, texelSize, isEnabled ? 1.0f : 0.0f));
+            new Vector4(shadowBufferIndex, 0.0f, 0.0f, 0.0f),
+            new Vector4(0.0f, 0.0f, 0.0f, isEnabled ? 1.0f : 0.0f));
     }
 }
 

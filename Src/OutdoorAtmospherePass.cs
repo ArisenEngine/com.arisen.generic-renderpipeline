@@ -1,5 +1,3 @@
-using System.Numerics;
-using System.Runtime.InteropServices;
 using Arisen.Native.RHI;
 using ArisenEngine.Core.Assets;
 using ArisenEngine.Core.Diagnostics;
@@ -8,7 +6,7 @@ using ArisenEngine.Rendering.Resources;
 
 namespace ArisenEngine.Rendering;
 
-public sealed class TonemapPass : RenderPassNode, IDisposable
+internal sealed class OutdoorAtmospherePass : RenderPassNode, IDisposable
 {
     private const ulong DynamicViewportScissorMask = 0x1UL | 0x2UL;
     private const string VertexStage = "Vertex";
@@ -25,64 +23,61 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
     private CookedAssetHandle m_VertexShaderAsset = CookedAssetHandle.Invalid;
     private CookedAssetHandle m_FragmentShaderAsset = CookedAssetHandle.Invalid;
     private AssetDependencyStamp m_ShaderStamp = AssetDependencyStamp.Empty;
-    private EFormat m_OutputFormat = EFormat.FORMAT_UNDEFINED;
-    private RHIImageHandle m_SceneColorImage = RHIImageHandle.Invalid;
-    private uint m_SceneColorImageIndex = 0xFFFFFFFFu;
-    private uint m_SceneColorSamplerIndex = 0xFFFFFFFFu;
-    private float m_Exposure = 1.0f;
-    private TonemapConstants m_Constants = TonemapConstants.Default;
+    private RHIImageViewHandle m_TargetImageView = RHIImageViewHandle.Invalid;
+    private EFormat m_TargetColorFormat = EFormat.FORMAT_UNDEFINED;
+    private EFormat m_ColorFormat = EFormat.FORMAT_UNDEFINED;
+    private EnvironmentFrameData m_FrameData;
     private bool m_Disposed;
 
-    public TonemapPass(
+    public OutdoorAtmospherePass(
         IAssetDatabase assetDatabase,
-        string name = "TonemapPass") : base(name)
+        string name = "OutdoorAtmospherePass") : base(name)
     {
         m_AssetDatabase = assetDatabase ?? throw new ArgumentNullException(nameof(assetDatabase));
-        m_Shader = GenericRenderPipelineShaderAssets.CreateTonemap();
+        m_Shader = GenericRenderPipelineShaderAssets.CreateOutdoorAtmosphere();
     }
 
-    public void SetSceneColor(
-        RHIImageHandle image,
-        uint bindlessImageIndex,
-        uint bindlessSamplerIndex)
+    public void SetFrameData(in EnvironmentFrameData frameData)
     {
-        m_SceneColorImage = image;
-        m_SceneColorImageIndex = bindlessImageIndex;
-        m_SceneColorSamplerIndex = bindlessSamplerIndex;
+        m_FrameData = frameData;
     }
 
-    public void SetExposure(float exposure)
+    public void SetColorTarget(RHIImageViewHandle imageView, EFormat format)
     {
-        m_Exposure = SceneEnvironment.NormalizeExposure(exposure);
+        m_TargetImageView = imageView;
+        m_TargetColorFormat = format;
     }
 
     public void Prepare(RenderContext context)
     {
+        using var _ = Profiler.Zone("OutdoorAtmospherePass.Prepare");
         ThrowIfDisposed();
+        if (!m_FrameData.AtmosphereEnabled)
+        {
+            return;
+        }
 
         var factory = context.Device.GetFactory();
-        var outputFormat = factory.GetImageViewFormat(context.SwapChain.GetImageView(context.FrameIndex));
-        m_Constants = TonemapConstants.From(
-            m_SceneColorImageIndex,
-            m_SceneColorSamplerIndex,
-            m_Exposure,
-            RenderOutputEncoding.RequiresExplicitSrgbEncoding(outputFormat));
+        var colorFormat = m_TargetColorFormat;
+        if (colorFormat == EFormat.FORMAT_UNDEFINED)
+        {
+            throw new InvalidOperationException(
+                "[OutdoorAtmospherePass] A graph-owned HDR color target is required.");
+        }
 
         var shaderStamp = AssetDependencyTracker.GetShaderStamp(m_AssetDatabase, m_Shader);
         if (m_Pipeline.IsValid &&
-            m_OutputFormat == outputFormat &&
+            m_ColorFormat == colorFormat &&
             m_ShaderStamp == shaderStamp)
         {
-            PlotDiagnostics(outputFormat);
             return;
         }
 
         ReleasePipelineResources();
         m_Factory = factory;
-        m_OutputFormat = outputFormat;
+        m_ColorFormat = colorFormat;
         RHIPipelineCache pipelineCache = context.Device.PipelineCache;
         m_PipelineCache = pipelineCache;
-
         try
         {
             m_VertexProgram = CompileProgram(
@@ -104,22 +99,27 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
                 EPolygonMode.EPOLYGON_MODE_FILL,
                 ECullModeFlagBits.CULL_MODE_NONE,
                 EFrontFace.FRONT_FACE_COUNTER_CLOCKWISE);
-            m_PipelineState.SetColorBlendState(false);
+            m_PipelineState.SetColorBlendState(
+                true,
+                EBlendFactor.BLEND_FACTOR_SRC_ALPHA,
+                EBlendFactor.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                EBlendOp.BLEND_OP_ADD);
             m_PipelineState.SetDepthStencilState(false, false, ECompareOp.COMPARE_OP_ALWAYS);
             m_PipelineState.SetDynamicStateMask(DynamicViewportScissorMask);
-            m_PipelineState.SetRenderingFormats(new[] { outputFormat }, EFormat.FORMAT_UNDEFINED);
+            m_PipelineState.SetRenderingFormats(new[] { colorFormat }, EFormat.FORMAT_UNDEFINED);
             m_PipelineState.BuildDescriptorSetLayout();
 
             m_Pipeline = pipelineCache.GetGraphicsPipeline(m_PipelineState);
             if (!m_Pipeline.IsValid)
             {
-                throw new InvalidOperationException("[TonemapPass] Failed to create graphics pipeline.");
+                throw new InvalidOperationException(
+                    "[OutdoorAtmospherePass] Failed to create graphics pipeline.");
             }
 
             m_ShaderStamp = shaderStamp;
             Logger.Log(
-                $"[TonemapPass] Prepared pipeline | OutputFormat: {outputFormat} | Pipeline: {m_Pipeline.Index}:{m_Pipeline.Generation}");
-            PlotDiagnostics(outputFormat);
+                $"[OutdoorAtmospherePass] Prepared pipeline | Format: {colorFormat} | " +
+                $"Pipeline: {m_Pipeline.Index}:{m_Pipeline.Generation}");
         }
         catch
         {
@@ -130,28 +130,31 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
 
     protected override void Record(RenderContext context, RenderCommandList commandList)
     {
-        if (!m_Pipeline.IsValid || !m_SceneColorImage.IsValid)
+        using var _ = Profiler.Zone("OutdoorAtmospherePass.Record");
+        if (!m_Pipeline.IsValid ||
+            !m_FrameData.IsValid ||
+            !m_FrameData.AtmosphereEnabled ||
+            !m_TargetImageView.IsValid)
         {
             return;
         }
 
-        var outputImageView = context.SwapChain.GetImageView(context.FrameIndex);
         commandList.BeginRendering(
-            outputImageView,
+            m_TargetImageView,
             EImageLayout.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            EAttachmentLoadOp.ATTACHMENT_LOAD_OP_CLEAR,
+            EAttachmentLoadOp.ATTACHMENT_LOAD_OP_LOAD,
             EAttachmentStoreOp.ATTACHMENT_STORE_OP_STORE,
             0.0f,
             0.0f,
             0.0f,
-            1.0f,
+            0.0f,
             0,
             0,
             context.Width,
             context.Height);
         commandList.BindPipeline(m_Pipeline);
         commandList.PushConstants(
-            m_Constants,
+            EnvironmentFramePushConstants.From(m_FrameData),
             EShaderStage.SHADER_STAGE_VERTEX_BIT | EShaderStage.SHADER_STAGE_FRAGMENT_BIT);
         commandList.SetViewport(0, 0, context.Width, context.Height);
         commandList.SetScissor(0, 0, context.Width, context.Height);
@@ -177,7 +180,6 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
     {
         shaderAssetHandle = CookedAssetHandle.Invalid;
         RHIShaderProgramHandle program = RHIShaderProgramHandle.Invalid;
-
         try
         {
             var cookedStage = ShaderAssetCooker.LoadOrCookStage(
@@ -191,7 +193,7 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
             if (!program.IsValid)
             {
                 throw new InvalidOperationException(
-                    $"[TonemapPass] Failed to allocate shader program for {cookedStage.Stage.EntryPoint}.");
+                    $"[OutdoorAtmospherePass] Failed to allocate shader program for {cookedStage.Stage.EntryPoint}.");
             }
 
             if (!m_Factory.AttachProgramByteCode(
@@ -201,7 +203,7 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
                     cookedStage.Stage.EntryPoint))
             {
                 throw new InvalidOperationException(
-                    $"[TonemapPass] Failed to attach shader bytecode for {cookedStage.Stage.EntryPoint}.");
+                    $"[OutdoorAtmospherePass] Failed to attach shader bytecode for {cookedStage.Stage.EntryPoint}.");
             }
 
             return program;
@@ -266,62 +268,14 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
         m_VertexShaderAsset = CookedAssetHandle.Invalid;
         m_FragmentShaderAsset = CookedAssetHandle.Invalid;
         m_ShaderStamp = AssetDependencyStamp.Empty;
-        m_OutputFormat = EFormat.FORMAT_UNDEFINED;
-    }
-
-    private void PlotDiagnostics(EFormat outputFormat)
-    {
-        Profiler.PlotValue("TonemapPass.Exposure", m_Exposure);
-        Profiler.PlotValue("TonemapPass.OutputFormat", (double)(uint)outputFormat);
-        Profiler.PlotValue(
-            "TonemapPass.ExplicitSrgbEncode",
-            RenderOutputEncoding.RequiresExplicitSrgbEncoding(outputFormat) ? 1 : 0);
+        m_ColorFormat = EFormat.FORMAT_UNDEFINED;
     }
 
     private void ThrowIfDisposed()
     {
         if (m_Disposed)
         {
-            throw new ObjectDisposedException(nameof(TonemapPass));
+            throw new ObjectDisposedException(nameof(OutdoorAtmospherePass));
         }
-    }
-}
-
-[StructLayout(LayoutKind.Sequential)]
-internal readonly struct TonemapConstants
-{
-    public static TonemapConstants Default => new(
-        Vector4.One,
-        0xFFFFFFFFu,
-        0xFFFFFFFFu);
-
-    public readonly Vector4 ToneMapParams;
-    public readonly uint SceneColorImageIndex;
-    public readonly uint SceneColorSamplerIndex;
-    public readonly uint Padding0;
-    public readonly uint Padding1;
-
-    private TonemapConstants(
-        Vector4 toneMapParams,
-        uint sceneColorImageIndex,
-        uint sceneColorSamplerIndex)
-    {
-        ToneMapParams = toneMapParams;
-        SceneColorImageIndex = sceneColorImageIndex;
-        SceneColorSamplerIndex = sceneColorSamplerIndex;
-        Padding0 = 0;
-        Padding1 = 0;
-    }
-
-    public static TonemapConstants From(
-        uint sceneColorImageIndex,
-        uint sceneColorSamplerIndex,
-        float exposure,
-        bool encodeOutputToSrgb)
-    {
-        return new TonemapConstants(
-            new Vector4(exposure, encodeOutputToSrgb ? 1.0f : 0.0f, 0.0f, 0.0f),
-            sceneColorImageIndex,
-            sceneColorSamplerIndex);
     }
 }
