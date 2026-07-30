@@ -12,6 +12,8 @@ public class GenericRenderPipelineAsset : RenderPipelineAsset
     private readonly GenericRenderMaterialLibrary? m_MaterialLibrary;
     private readonly DeferredRenderResourceDisposalQueue? m_DisposalQueue;
     private readonly GenericPreparedAssetProvider? m_PreparedAssetProvider;
+    private readonly IGenericRenderPipelineFeature[] m_Features =
+        Array.Empty<IGenericRenderPipelineFeature>();
 
     public GenericRenderPipelineAsset()
     {
@@ -22,13 +24,18 @@ public class GenericRenderPipelineAsset : RenderPipelineAsset
         IAssetDatabase assetDatabase,
         GenericRenderMaterialLibrary materialLibrary,
         DeferredRenderResourceDisposalQueue disposalQueue,
-        GenericPreparedAssetProvider preparedAssetProvider)
+        GenericPreparedAssetProvider preparedAssetProvider,
+        IGenericRenderPipelineFeature[] features)
     {
         m_Settings = settings;
         m_AssetDatabase = assetDatabase;
         m_MaterialLibrary = materialLibrary;
         m_DisposalQueue = disposalQueue;
         m_PreparedAssetProvider = preparedAssetProvider;
+        ArgumentNullException.ThrowIfNull(features);
+        m_Features = features.Length == 0
+            ? Array.Empty<IGenericRenderPipelineFeature>()
+            : (IGenericRenderPipelineFeature[])features.Clone();
     }
 
     protected override void AfterDeserialize()
@@ -45,6 +52,7 @@ public class GenericRenderPipelineAsset : RenderPipelineAsset
             m_AssetDatabase ?? throw new InvalidOperationException("[GenericRP] Asset database service was not assigned."),
             m_MaterialLibrary ?? throw new InvalidOperationException("[GenericRP] Material library service was not assigned."),
             m_DisposalQueue ?? throw new InvalidOperationException("[GenericRP] Deferred disposal queue was not assigned."),
-            m_PreparedAssetProvider ?? throw new InvalidOperationException("[GenericRP] Prepared asset provider was not assigned."));
+            m_PreparedAssetProvider ?? throw new InvalidOperationException("[GenericRP] Prepared asset provider was not assigned."),
+            m_Features);
     }
 }

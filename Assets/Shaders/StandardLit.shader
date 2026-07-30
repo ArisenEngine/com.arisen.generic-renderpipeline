@@ -57,7 +57,7 @@ Shader "GenericRP/StandardLit"
             };
 
             [[vk::binding(2, 3)]]
-            StructuredBuffer<StaticMeshObjectData> BindlessObjectBuffers[] : register(t2, space3);
+            ByteAddressBuffer BindlessBuffers[] : register(t2, space3);
 
             [[vk::push_constant]]
             struct
@@ -98,7 +98,7 @@ Shader "GenericRP/StandardLit"
                 float3 WorldTangent : TANGENT0;
                 float TangentSign : TANGENT1;
                 float3 WorldPosition : TEXCOORD1;
-                float4 ShadowClipPosition : TEXCOORD2;
+                float CameraDepth : TEXCOORD2;
                 nointerpolation float4 ShadowTextureIndices : TEXCOORD3;
                 nointerpolation float4 ShadowParameters : TEXCOORD4;
                 nointerpolation float4 EmissiveFactor : TEXCOORD5;
@@ -114,6 +114,45 @@ Shader "GenericRP/StandardLit"
             static const float PI = 3.14159265359;
             static const uint MAX_POINT_LIGHTS = 4;
             static const uint MAX_SPOT_LIGHTS = 4;
+            static const uint STATIC_MESH_OBJECT_VECTOR_COUNT = 21;
+            static const uint STATIC_MESH_OBJECT_BYTE_SIZE =
+                STATIC_MESH_OBJECT_VECTOR_COUNT * 16;
+
+            float4 LoadBufferVector(
+                uint bufferIndex,
+                uint byteOffset)
+            {
+                return asfloat(BindlessBuffers[
+                    NonUniformResourceIndex(bufferIndex)].Load4(byteOffset));
+            }
+
+            StaticMeshObjectData LoadObjectData(uint bufferIndex, uint objectIndex)
+            {
+                uint baseOffset = objectIndex * STATIC_MESH_OBJECT_BYTE_SIZE;
+                StaticMeshObjectData result;
+                result.modelViewProjectionColumn0 = LoadBufferVector(bufferIndex, baseOffset + 0 * 16);
+                result.modelViewProjectionColumn1 = LoadBufferVector(bufferIndex, baseOffset + 1 * 16);
+                result.modelViewProjectionColumn2 = LoadBufferVector(bufferIndex, baseOffset + 2 * 16);
+                result.modelViewProjectionColumn3 = LoadBufferVector(bufferIndex, baseOffset + 3 * 16);
+                result.localToWorldColumn0 = LoadBufferVector(bufferIndex, baseOffset + 4 * 16);
+                result.localToWorldColumn1 = LoadBufferVector(bufferIndex, baseOffset + 5 * 16);
+                result.localToWorldColumn2 = LoadBufferVector(bufferIndex, baseOffset + 6 * 16);
+                result.shadowModelViewProjectionColumn0 = LoadBufferVector(bufferIndex, baseOffset + 7 * 16);
+                result.shadowModelViewProjectionColumn1 = LoadBufferVector(bufferIndex, baseOffset + 8 * 16);
+                result.shadowModelViewProjectionColumn2 = LoadBufferVector(bufferIndex, baseOffset + 9 * 16);
+                result.shadowModelViewProjectionColumn3 = LoadBufferVector(bufferIndex, baseOffset + 10 * 16);
+                result.shadowTextureIndices = LoadBufferVector(bufferIndex, baseOffset + 11 * 16);
+                result.shadowParameters = LoadBufferVector(bufferIndex, baseOffset + 12 * 16);
+                result.emissiveFactor = LoadBufferVector(bufferIndex, baseOffset + 13 * 16);
+                result.emissiveTextureIndices = LoadBufferVector(bufferIndex, baseOffset + 14 * 16);
+                result.metallicRoughnessTextureIndices = LoadBufferVector(bufferIndex, baseOffset + 15 * 16);
+                result.occlusionTextureIndices = LoadBufferVector(bufferIndex, baseOffset + 16 * 16);
+                result.pbrMaterialParameters = LoadBufferVector(bufferIndex, baseOffset + 17 * 16);
+                result.environmentTextureIndices0 = LoadBufferVector(bufferIndex, baseOffset + 18 * 16);
+                result.environmentTextureIndices1 = LoadBufferVector(bufferIndex, baseOffset + 19 * 16);
+                result.environmentParameters = LoadBufferVector(bufferIndex, baseOffset + 20 * 16);
+                return result;
+            }
 
             float3 TransformDirection(float3 direction, StaticMeshObjectData objectData)
             {
@@ -134,8 +173,9 @@ Shader "GenericRP/StandardLit"
             VSOutput VSMain(VSInput input)
             {
                 VSOutput output;
-                StaticMeshObjectData objectData =
-                    BindlessObjectBuffers[NonUniformResourceIndex(DrawConstants.objectBufferIndex)][DrawConstants.objectIndex];
+                StaticMeshObjectData objectData = LoadObjectData(
+                    DrawConstants.objectBufferIndex,
+                    DrawConstants.objectIndex);
                 float4 localPosition = float4(input.Position, 1.0);
                 output.Position = float4(
                     dot(localPosition, objectData.modelViewProjectionColumn0),
@@ -148,11 +188,7 @@ Shader "GenericRP/StandardLit"
                 output.WorldTangent = TransformDirection(input.Tangent.xyz, objectData);
                 output.TangentSign = input.Tangent.w;
                 output.WorldPosition = TransformPosition(localPosition, objectData);
-                output.ShadowClipPosition = float4(
-                    dot(localPosition, objectData.shadowModelViewProjectionColumn0),
-                    dot(localPosition, objectData.shadowModelViewProjectionColumn1),
-                    dot(localPosition, objectData.shadowModelViewProjectionColumn2),
-                    dot(localPosition, objectData.shadowModelViewProjectionColumn3));
+                output.CameraDepth = max(output.Position.w, 0.0);
                 output.ShadowTextureIndices = objectData.shadowTextureIndices;
                 output.ShadowParameters = objectData.shadowParameters;
                 output.EmissiveFactor = objectData.emissiveFactor;
@@ -294,14 +330,25 @@ Shader "GenericRP/StandardLit"
                 return (diffuseWeight * albedo / PI + specular) * radiance * ndotl;
             }
 
-            float SampleDirectionalShadow(VSOutput input, float ndotl)
+            float SampleDirectionalShadowCascade(
+                uint shadowBufferIndex,
+                uint cascadeIndex,
+                float3 cameraRelativePosition,
+                float ndotl)
             {
-                if (input.ShadowParameters.w < 0.5 || input.ShadowClipPosition.w <= 0.0)
+                uint matrixOffset = cascadeIndex * 4;
+                float4 position = float4(cameraRelativePosition, 1.0);
+                float4 shadowClip = float4(
+                    dot(position, LoadBufferVector(shadowBufferIndex, (matrixOffset + 0) * 16)),
+                    dot(position, LoadBufferVector(shadowBufferIndex, (matrixOffset + 1) * 16)),
+                    dot(position, LoadBufferVector(shadowBufferIndex, (matrixOffset + 2) * 16)),
+                    dot(position, LoadBufferVector(shadowBufferIndex, (matrixOffset + 3) * 16)));
+                if (shadowClip.w <= 0.0)
                 {
                     return 1.0;
                 }
 
-                float3 projected = input.ShadowClipPosition.xyz / input.ShadowClipPosition.w;
+                float3 projected = shadowClip.xyz / shadowClip.w;
                 if (projected.x < -1.0 || projected.x > 1.0 ||
                     projected.y < -1.0 || projected.y > 1.0 ||
                     projected.z < 0.0 || projected.z > 1.0)
@@ -309,20 +356,16 @@ Shader "GenericRP/StandardLit"
                     return 1.0;
                 }
 
-                uint shadowImageIndex = (uint)input.ShadowTextureIndices.x;
-                uint shadowSamplerIndex = (uint)input.ShadowTextureIndices.y;
-                float2 shadowUV = float2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);
-                float receiverDepth = projected.z;
-                float baseBias = max(input.ShadowParameters.x, 0.0);
-                float slopeBias = max(input.ShadowTextureIndices.w, 0.0);
-                float bias = baseBias + slopeBias * (1.0 - saturate(ndotl));
-                float strength = saturate(input.ShadowParameters.y);
-                float texelSize = max(input.ShadowParameters.z, 0.00001);
-                int pcfRadius = clamp((int)(input.ShadowTextureIndices.z + 0.5), 0, 3);
-
-                Texture2D<float4> shadowMap = BindlessImages[NonUniformResourceIndex(shadowImageIndex)];
-                SamplerState shadowSampler = BindlessSamplers[NonUniformResourceIndex(shadowSamplerIndex)];
-
+                float4 shadowImageIndices = LoadBufferVector(shadowBufferIndex, 18 * 16);
+                float4 samplingParameters = LoadBufferVector(shadowBufferIndex, 19 * 16);
+                uint4 metadata = asuint(LoadBufferVector(shadowBufferIndex, 20 * 16));
+                uint shadowImageIndex = asuint(shadowImageIndices[cascadeIndex]);
+                float2 shadowUV = float2(
+                    projected.x * 0.5 + 0.5,
+                    0.5 - projected.y * 0.5);
+                float bias = max(samplingParameters.x, 0.0) +
+                    max(samplingParameters.y, 0.0) * (1.0 - saturate(ndotl));
+                int pcfRadius = clamp((int)metadata.y, 0, 3);
                 float visible = 0.0;
                 float sampleCount = 0.0;
                 [loop]
@@ -331,15 +374,83 @@ Shader "GenericRP/StandardLit"
                     [loop]
                     for (int x = -pcfRadius; x <= pcfRadius; x++)
                     {
-                        float2 sampleUV = shadowUV + float2(x, y) * texelSize;
-                        float sampledDepth = shadowMap.SampleLevel(shadowSampler, sampleUV, 0.0).r;
-                        visible += receiverDepth - bias <= sampledDepth ? 1.0 : 0.0;
+                        float2 sampleUV = shadowUV + float2(x, y) *
+                            max(samplingParameters.w, 0.00001);
+                        float sampledDepth = BindlessImages[
+                            NonUniformResourceIndex(shadowImageIndex)].SampleLevel(
+                                BindlessSamplers[
+                                    NonUniformResourceIndex(metadata.x)],
+                                sampleUV,
+                                0.0).r;
+                        visible += projected.z - bias <= sampledDepth ? 1.0 : 0.0;
                         sampleCount += 1.0;
                     }
                 }
 
                 visible /= max(sampleCount, 1.0);
-                return lerp(1.0 - strength, 1.0, visible);
+                return lerp(
+                    1.0 - saturate(samplingParameters.z),
+                    1.0,
+                    visible);
+            }
+
+            float SampleDirectionalShadow(VSOutput input, float ndotl)
+            {
+                if (input.ShadowParameters.w < 0.5)
+                {
+                    return 1.0;
+                }
+
+                uint shadowBufferIndex = (uint)input.ShadowTextureIndices.x;
+                float4 splitFar = LoadBufferVector(shadowBufferIndex, 16 * 16);
+                float4 transitionStart = LoadBufferVector(shadowBufferIndex, 17 * 16);
+                uint4 metadata = asuint(LoadBufferVector(shadowBufferIndex, 20 * 16));
+                float4 distanceParameters = LoadBufferVector(shadowBufferIndex, 21 * 16);
+                uint cascadeCount = min(metadata.z, 4u);
+                if (metadata.w == 0 || cascadeCount == 0 ||
+                    input.CameraDepth > distanceParameters.y)
+                {
+                    return 1.0;
+                }
+
+                uint cascadeIndex = cascadeCount - 1;
+                [unroll]
+                for (uint index = 0; index < 4; index++)
+                {
+                    if (index < cascadeCount && input.CameraDepth <= splitFar[index])
+                    {
+                        cascadeIndex = index;
+                        break;
+                    }
+                }
+
+                float3 cameraRelativePosition =
+                    input.WorldPosition - DrawConstants.cameraWorldPosition.xyz;
+                float shadow = SampleDirectionalShadowCascade(
+                    shadowBufferIndex,
+                    cascadeIndex,
+                    cameraRelativePosition,
+                    ndotl);
+                if (cascadeIndex + 1 < cascadeCount &&
+                    input.CameraDepth > transitionStart[cascadeIndex])
+                {
+                    float transition = saturate(
+                        (input.CameraDepth - transitionStart[cascadeIndex]) /
+                        max(splitFar[cascadeIndex] - transitionStart[cascadeIndex], 0.0001));
+                    shadow = lerp(
+                        shadow,
+                        SampleDirectionalShadowCascade(
+                            shadowBufferIndex,
+                            cascadeIndex + 1,
+                            cameraRelativePosition,
+                            ndotl),
+                        transition);
+                }
+
+                float terminalFade = saturate(
+                    (input.CameraDepth - distanceParameters.z) /
+                    max(distanceParameters.y - distanceParameters.z, 0.0001));
+                return lerp(shadow, 1.0, terminalFade);
             }
 
             float3 ResolveEmissive(VSOutput input)
@@ -452,9 +563,9 @@ Shader "GenericRP/StandardLit"
                         break;
                     }
 
-                    StaticMeshObjectData pointLightData =
-                        BindlessObjectBuffers[NonUniformResourceIndex(DrawConstants.objectBufferIndex)]
-                            [DrawConstants.pointLightDataStart + lightIndex];
+                    StaticMeshObjectData pointLightData = LoadObjectData(
+                        DrawConstants.objectBufferIndex,
+                        DrawConstants.pointLightDataStart + lightIndex);
                     float4 positionRange = pointLightData.modelViewProjectionColumn0;
                     float4 colorIntensity = pointLightData.modelViewProjectionColumn1;
                     float3 toLight = positionRange.xyz - input.WorldPosition;
@@ -491,9 +602,9 @@ Shader "GenericRP/StandardLit"
                         break;
                     }
 
-                    StaticMeshObjectData spotLightData =
-                        BindlessObjectBuffers[NonUniformResourceIndex(DrawConstants.objectBufferIndex)]
-                            [spotLightDataStart + lightIndex];
+                    StaticMeshObjectData spotLightData = LoadObjectData(
+                        DrawConstants.objectBufferIndex,
+                        spotLightDataStart + lightIndex);
                     float4 positionRange = spotLightData.modelViewProjectionColumn0;
                     float4 colorIntensity = spotLightData.modelViewProjectionColumn1;
                     float4 directionInner = spotLightData.modelViewProjectionColumn2;

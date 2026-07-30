@@ -14,9 +14,9 @@ public sealed record CookedGenericRenderPipelineSettings(
 
 public static class GenericRenderPipelineSettingsCooker
 {
-    public const string RuntimeVariant = "generic-rp.settings.v1";
+    public const string RuntimeVariant = "generic-rp.settings.v2";
     public const string CookedExtension = ".renderpipeline";
-    public const int CookedFormatVersion = 1;
+    public const int CookedFormatVersion = 2;
 
     private const int MaxNameBytes = 16 * 1024;
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARISGRPS");
@@ -133,6 +133,10 @@ public static class GenericRenderPipelineSettingsCooker
             writer.Write(settings.Shadows.SlopeBias);
             writer.Write(settings.Shadows.Strength);
             writer.Write(settings.Shadows.PcfRadius);
+            writer.Write(settings.Shadows.CascadeCount);
+            writer.Write(settings.Shadows.MaximumDistance);
+            writer.Write(settings.Shadows.PracticalSplitWeight);
+            writer.Write(settings.Shadows.TerminalFadeFraction);
         }
 
         var output = new FileInfo(outputPath);
@@ -161,10 +165,10 @@ public static class GenericRenderPipelineSettingsCooker
         }
 
         int version = reader.ReadInt32();
-        if (version != CookedFormatVersion)
+        if (version is not (1 or CookedFormatVersion))
         {
             throw new InvalidDataException(
-                $"format version '{version}' is unsupported; expected '{CookedFormatVersion}'");
+                $"format version '{version}' is unsupported; expected 1 or '{CookedFormatVersion}'");
         }
 
         Guid payloadGuid = reader.ReadGuid();
@@ -191,13 +195,36 @@ public static class GenericRenderPipelineSettingsCooker
             throw new InvalidDataException("shadow enabled flag is not canonical");
         }
 
-        var shadows = new GenericShadowSettings(
-            rawEnabled != 0,
-            reader.ReadUInt32(),
-            reader.ReadSingle(),
-            reader.ReadSingle(),
-            reader.ReadSingle(),
-            reader.ReadInt32());
+        bool enabled = rawEnabled != 0;
+        uint mapSize = reader.ReadUInt32();
+        float depthBias = reader.ReadSingle();
+        float slopeBias = reader.ReadSingle();
+        float strength = reader.ReadSingle();
+        int pcfRadius = reader.ReadInt32();
+        GenericShadowSettings defaults = GenericShadowSettings.Default;
+        var shadows = version == 1
+            ? new GenericShadowSettings(
+                enabled,
+                mapSize,
+                depthBias,
+                slopeBias,
+                strength,
+                pcfRadius,
+                defaults.CascadeCount,
+                defaults.MaximumDistance,
+                defaults.PracticalSplitWeight,
+                defaults.TerminalFadeFraction)
+            : new GenericShadowSettings(
+                enabled,
+                mapSize,
+                depthBias,
+                slopeBias,
+                strength,
+                pcfRadius,
+                reader.ReadInt32(),
+                reader.ReadSingle(),
+                reader.ReadSingle(),
+                reader.ReadSingle());
         reader.EnsureFullyRead();
         ValidateCookedSettings(clearColor, shadows);
         return new GenericRenderPipelineSettings(name, clearColor, shadows);
@@ -225,6 +252,27 @@ public static class GenericRenderPipelineSettingsCooker
         {
             throw new InvalidDataException("Shadows.PcfRadius must be between 0 and 3");
         }
+
+        if (shadows.CascadeCount < 1 || shadows.CascadeCount > 4)
+        {
+            throw new InvalidDataException("Shadows.CascadeCount must be between 1 and 4");
+        }
+
+        ValidateFiniteRange(
+            "Shadows.MaximumDistance",
+            shadows.MaximumDistance,
+            5.0f,
+            10000.0f);
+        ValidateFiniteRange(
+            "Shadows.PracticalSplitWeight",
+            shadows.PracticalSplitWeight,
+            0.0f,
+            1.0f);
+        ValidateFiniteRange(
+            "Shadows.TerminalFadeFraction",
+            shadows.TerminalFadeFraction,
+            0.0f,
+            0.5f);
     }
 
     private static void ValidateFiniteRange(
@@ -313,13 +361,15 @@ public sealed class GenericRenderPipelineRuntimeAssetCooker : IRuntimeAssetCooke
     private readonly AssetRef<MaterialSourceAsset> m_DefaultMaterial;
     private readonly AssetRef<MeshSourceAsset> m_FallbackMesh;
     private readonly ShaderAsset[] m_RuntimeShaders;
+    private readonly GenericRenderPipelineRuntimeShaderRegistry? m_OptionalRuntimeShaders;
 
     public GenericRenderPipelineRuntimeAssetCooker(
         IAssetDatabase assetDatabase,
         IRuntimeShaderCookRecipeRegistry shaderRecipes,
         AssetRef<MaterialSourceAsset> defaultMaterial,
         AssetRef<MeshSourceAsset> fallbackMesh,
-        IEnumerable<ShaderAsset> runtimeShaders)
+        IEnumerable<ShaderAsset> runtimeShaders,
+        GenericRenderPipelineRuntimeShaderRegistry? optionalRuntimeShaders = null)
     {
         m_AssetDatabase = assetDatabase ?? throw new ArgumentNullException(nameof(assetDatabase));
         m_ShaderRecipes = shaderRecipes ?? throw new ArgumentNullException(nameof(shaderRecipes));
@@ -341,6 +391,7 @@ public sealed class GenericRenderPipelineRuntimeAssetCooker : IRuntimeAssetCooke
         m_DefaultMaterial = defaultMaterial;
         m_FallbackMesh = fallbackMesh;
         m_RuntimeShaders = runtimeShaders.ToArray();
+        m_OptionalRuntimeShaders = optionalRuntimeShaders;
         if (m_RuntimeShaders.Length == 0 || m_RuntimeShaders.Any(shader => shader == null))
         {
             throw new ArgumentException(
@@ -390,25 +441,19 @@ public sealed class GenericRenderPipelineRuntimeAssetCooker : IRuntimeAssetCooke
             Variant: string.Empty,
             Required: true));
 
-        foreach (ShaderAsset shader in m_RuntimeShaders)
+        AddShaderDependencies(
+            dependencies,
+            m_RuntimeShaders,
+            "com.arisen.generic-renderpipeline");
+        if (m_OptionalRuntimeShaders != null)
         {
-            AssetRecord shaderSource = GetAsset(
-                shader.Guid,
-                ShaderAssetCooker.ShaderSourceAssetType);
-            foreach (ShaderStageAsset stage in shader.Stages)
+            foreach (GenericRenderPipelineRuntimeShaderContribution contribution in
+                     m_OptionalRuntimeShaders.GetContributions())
             {
-                m_ShaderRecipes.RegisterRecipe(
-                    shader,
-                    stage.Name,
-                    "com.arisen.generic-renderpipeline");
-                dependencies.Add(new RuntimeAssetCookDependencyRequest(
-                    shader.Guid,
-                    shaderSource.PackageId,
-                    shaderSource.AssetType,
-                    shader.Variant.GetCookedVariant(
-                        stage.EntryPoint,
-                        shader.VariantKeywords),
-                    Required: true));
+                AddShaderDependencies(
+                    dependencies,
+                    [contribution.Shader],
+                    contribution.OwnerId);
             }
         }
 
@@ -421,6 +466,31 @@ public sealed class GenericRenderPipelineRuntimeAssetCooker : IRuntimeAssetCooke
             Required: true));
 
         return dependencies.ToArray();
+    }
+
+    private void AddShaderDependencies(
+        List<RuntimeAssetCookDependencyRequest> dependencies,
+        IEnumerable<ShaderAsset> shaders,
+        string ownerId)
+    {
+        foreach (ShaderAsset shader in shaders)
+        {
+            AssetRecord shaderSource = GetAsset(
+                shader.Guid,
+                ShaderAssetCooker.ShaderSourceAssetType);
+            foreach (ShaderStageAsset stage in shader.Stages)
+            {
+                m_ShaderRecipes.RegisterRecipe(shader, stage.Name, ownerId);
+                dependencies.Add(new RuntimeAssetCookDependencyRequest(
+                    shader.Guid,
+                    shaderSource.PackageId,
+                    shaderSource.AssetType,
+                    shader.Variant.GetCookedVariant(
+                        stage.EntryPoint,
+                        shader.VariantKeywords),
+                    Required: true));
+            }
+        }
     }
 
     private void ValidateRequest(RuntimeAssetCookRequest request)

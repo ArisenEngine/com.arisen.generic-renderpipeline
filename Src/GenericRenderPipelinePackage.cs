@@ -2,6 +2,7 @@ using ArisenKernel.Packages;
 using ArisenKernel.Services;
 using ArisenKernel.Diagnostics;
 using ArisenEngine.Core.Assets;
+using ArisenEngine.Rendering.Resources;
 using ArisenEngine.Resources.Serialization;
 
 namespace ArisenEngine.Rendering;
@@ -15,6 +16,8 @@ public class GenericRenderPipelinePackage : IPackageEntry
     private GenericRenderMaterialLibrary? m_MaterialLibrary;
     private DeferredRenderResourceDisposalQueue? m_DisposalQueue;
     private GenericPreparedAssetProvider? m_PreparedAssetProvider;
+    private GenericRenderPipelineFeatureRegistry? m_FeatureRegistry;
+    private GenericRenderPipelineRuntimeShaderRegistry? m_RuntimeShaderRegistry;
     private IRuntimeAssetResidencyService? m_ResidencyService;
 
     public void OnLoad(IServiceRegistry registry)
@@ -22,17 +25,25 @@ public class GenericRenderPipelinePackage : IPackageEntry
         KernelLog.Info("[GenericRP] Registering render-pipeline provider...");
 
         var assetDatabase = registry.GetService<IAssetDatabase>();
+        m_RuntimeShaderRegistry = new GenericRenderPipelineRuntimeShaderRegistry();
+        registry.RegisterService<IGenericRenderPipelineRuntimeShaderRegistry>(
+            m_RuntimeShaderRegistry);
         registry.GetService<IRuntimeAssetCookerRegistry>().RegisterCooker(
             new GenericRenderPipelineRuntimeAssetCooker(
                 assetDatabase,
                 registry.GetService<IRuntimeShaderCookRecipeRegistry>(),
                 GenericRenderPipelineAssetRefs.StandardLitMaterial.Ref,
                 GenericRenderPipelineAssetRefs.FacetedCrystalMesh.Ref,
-                GenericRenderPipelineShaderAssets.CreateRuntimeShaders()));
+                GenericRenderPipelineShaderAssets.CreateRuntimeShaders(),
+                m_RuntimeShaderRegistry));
         m_DisposalQueue = new DeferredRenderResourceDisposalQueue();
         m_MaterialLibrary = new GenericRenderMaterialLibrary(assetDatabase, m_DisposalQueue);
         m_MaterialLibrary.RegisterDefaultMaterial(GenericRenderPipelineAssetRefs.StandardLitMaterial.Ref);
         registry.RegisterService<IRenderMaterialLibrary>(m_MaterialLibrary);
+        registry.RegisterService<IRHITexture2DResourceCache>(
+            m_MaterialLibrary.TextureResourceCache);
+        m_FeatureRegistry = new GenericRenderPipelineFeatureRegistry();
+        registry.RegisterService<IGenericRenderPipelineFeatureRegistry>(m_FeatureRegistry);
         m_PreparedAssetProvider = new GenericPreparedAssetProvider(
             assetDatabase,
             m_MaterialLibrary,
@@ -43,7 +54,9 @@ public class GenericRenderPipelinePackage : IPackageEntry
             assetDatabase,
             m_MaterialLibrary,
             m_DisposalQueue,
-            m_PreparedAssetProvider);
+            m_PreparedAssetProvider,
+            m_FeatureRegistry,
+            m_ResidencyService);
         registry.RegisterService<IRenderPipelineProvider>(m_Provider);
 
         KernelLog.Info("[GenericRP] Provider registered; project selection activates it during RenderSubsystem initialization.");
@@ -51,8 +64,8 @@ public class GenericRenderPipelinePackage : IPackageEntry
 
     public void OnUnload(IServiceRegistry registry)
     {
-        m_Provider?.Deactivate();
         m_Provider?.ReleaseDeviceResources();
+        m_Provider?.Deactivate();
         m_Provider = null;
         m_ResidencyService?.UnregisterPreparedProvider(GenericPreparedAssetProvider.Id);
         m_ResidencyService = null;
@@ -60,6 +73,8 @@ public class GenericRenderPipelinePackage : IPackageEntry
         m_MaterialLibrary?.Dispose();
         m_MaterialLibrary = null;
         m_DisposalQueue = null;
+        m_FeatureRegistry = null;
+        m_RuntimeShaderRegistry = null;
         KernelLog.Info("[GenericRP] Unloaded.");
     }
 }

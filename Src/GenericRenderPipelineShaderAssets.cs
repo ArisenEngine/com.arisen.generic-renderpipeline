@@ -21,7 +21,10 @@ internal static class GenericRenderPipelineShaderAssets
         return new ShaderAsset(
             GenericRenderPipelineAssetRefs.DirectionalShadowShader.Ref.Guid,
             "GenericRP/DirectionalShadow",
-            [new ShaderStageAsset("Vertex", EProgramStage.Vertex, "VSMain")],
+            [
+                new ShaderStageAsset("Vertex", EProgramStage.Vertex, "VSMain"),
+                new ShaderStageAsset("Fragment", EProgramStage.Fragment, "PSMain")
+            ],
             ShaderVariantKey.VulkanDebug);
     }
 
@@ -37,8 +40,26 @@ internal static class GenericRenderPipelineShaderAssets
             ShaderVariantKey.VulkanDebug);
     }
 
+    public static ShaderAsset CreateOutdoorAtmosphere()
+    {
+        return new ShaderAsset(
+            GenericRenderPipelineAssetRefs.OutdoorAtmosphereShader.Ref.Guid,
+            "GenericRP/OutdoorAtmosphere",
+            [
+                new ShaderStageAsset("Vertex", EProgramStage.Vertex, "VSMain"),
+                new ShaderStageAsset("Fragment", EProgramStage.Fragment, "PSMain")
+            ],
+            ShaderVariantKey.VulkanDebug);
+    }
+
     public static ShaderAsset[] CreateRuntimeShaders()
     {
-        return [CreateDirectionalShadow(), CreateEnvironmentSky(), CreateTonemap()];
+        return
+        [
+            CreateDirectionalShadow(),
+            CreateEnvironmentSky(),
+            CreateOutdoorAtmosphere(),
+            CreateTonemap()
+        ];
     }
 }

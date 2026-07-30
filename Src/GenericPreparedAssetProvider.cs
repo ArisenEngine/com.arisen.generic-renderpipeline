@@ -19,6 +19,7 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
     private readonly HashSet<RuntimeAssetResidencyKey> m_Materials = new();
     private readonly Dictionary<RuntimeAssetResidencyKey, PreparedEnvironment> m_Environments = new();
     private RHIDevice m_Device;
+    private ulong m_DeviceGeneration;
     private ulong m_LastSubmittedTicket;
     private long m_EstimatedGpuBytes;
 
@@ -92,10 +93,19 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
         m_DisposalQueue.PendingCount,
         m_MaterialLibrary.PreparedMaterialCount);
 
-    public void UpdateFrameContext(RHIDevice device, ulong lastSubmittedTicket)
+    public ulong UpdateFrameContext(
+        RHIDevice device,
+        ulong deviceGeneration,
+        ulong lastSubmittedTicket)
     {
-        if (device.IsValid) m_Device = device;
+        if (device.IsValid)
+        {
+            m_DisposalQueue.BindDevice(device, deviceGeneration);
+            m_Device = device;
+            m_DeviceGeneration = deviceGeneration;
+        }
         m_LastSubmittedTicket = Math.Max(m_LastSubmittedTicket, lastSubmittedTicket);
+        return m_LastSubmittedTicket;
     }
 
     public void UpdateSubmittedTicket(ulong submittedTicket)
@@ -192,6 +202,45 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
         m_Materials.Clear();
         m_Environments.Clear();
         m_EstimatedGpuBytes = 0;
+    }
+
+    public void ReleaseDevice()
+    {
+        if (m_Meshes.Count != 0 ||
+            m_Materials.Count != 0 ||
+            m_Environments.Count != 0)
+        {
+            throw new InvalidOperationException(
+                "GenericRP cannot release its RHI device while prepared resources remain.");
+        }
+
+        if (m_Device.IsValid)
+        {
+            m_DisposalQueue.ReleaseDevice(
+                m_Device,
+                m_DeviceGeneration,
+                m_LastSubmittedTicket);
+        }
+        else if (m_DisposalQueue.PendingCount != 0)
+        {
+            throw new InvalidOperationException(
+                $"GenericRP cannot release {m_DisposalQueue.PendingCount} deferred resources without a valid RHI device.");
+        }
+
+        m_Device = default;
+        m_DeviceGeneration = 0;
+        m_LastSubmittedTicket = 0;
+    }
+
+    public void ReleaseAllDeviceResources()
+    {
+        if (m_Device.IsValid && m_LastSubmittedTicket != 0)
+        {
+            m_Device.WaitQueueTicket(m_LastSubmittedTicket);
+        }
+
+        ReleaseAll(disposeImmediately: true);
+        ReleaseDevice();
     }
 
     private RuntimePreparedAssetResult PrepareMesh(RuntimeAssetResidencyKey key)

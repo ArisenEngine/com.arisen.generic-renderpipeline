@@ -51,6 +51,8 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
 
     public long EstimatedTextureGpuBytes => m_TextureCache.EstimatedGpuBytes;
 
+    public IRHITexture2DResourceCache TextureResourceCache => m_TextureCache;
+
     public GenericRenderMaterialLibrary(
         IAssetDatabase assetDatabase,
         DeferredRenderResourceDisposalQueue disposalQueue)

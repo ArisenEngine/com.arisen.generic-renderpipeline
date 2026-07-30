@@ -17,6 +17,7 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly ShaderAsset m_Shader;
     private RHIFactory m_Factory;
+    private RHIPipelineCache? m_PipelineCache;
     private RHIPipelineState m_PipelineState;
     private RHIPipelineHandle m_Pipeline = RHIPipelineHandle.Invalid;
     private RHIShaderProgramHandle m_VertexProgram = RHIShaderProgramHandle.Invalid;
@@ -79,6 +80,8 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
         ReleasePipelineResources();
         m_Factory = factory;
         m_OutputFormat = outputFormat;
+        RHIPipelineCache pipelineCache = context.Device.PipelineCache;
+        m_PipelineCache = pipelineCache;
 
         try
         {
@@ -91,7 +94,7 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
                 FragmentStage,
                 out m_FragmentShaderAsset);
 
-            m_PipelineState = context.Device.PipelineCache.GetPipelineState();
+            m_PipelineState = pipelineCache.GetPipelineState();
             m_PipelineState.AddProgram(m_VertexProgram);
             m_PipelineState.AddProgram(m_FragmentProgram);
             m_PipelineState.SetBindPoint(EPipelineBindPoint.PIPELINE_BIND_POINT_GRAPHICS);
@@ -107,7 +110,7 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
             m_PipelineState.SetRenderingFormats(new[] { outputFormat }, EFormat.FORMAT_UNDEFINED);
             m_PipelineState.BuildDescriptorSetLayout();
 
-            m_Pipeline = context.Device.PipelineCache.GetGraphicsPipeline(m_PipelineState);
+            m_Pipeline = pipelineCache.GetGraphicsPipeline(m_PipelineState);
             if (!m_Pipeline.IsValid)
             {
                 throw new InvalidOperationException("[TonemapPass] Failed to create graphics pipeline.");
@@ -222,6 +225,12 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
 
     private void ReleasePipelineResources()
     {
+        if (m_Pipeline.IsValid && m_PipelineCache is not null)
+        {
+            m_PipelineCache.ReleasePipeline(m_Pipeline);
+        }
+        m_Pipeline = RHIPipelineHandle.Invalid;
+
         if (m_PipelineState.IsValid)
         {
             m_PipelineState.Release();
@@ -251,7 +260,7 @@ public sealed class TonemapPass : RenderPassNode, IDisposable
         }
 
         m_PipelineState = default;
-        m_Pipeline = RHIPipelineHandle.Invalid;
+        m_PipelineCache = null;
         m_VertexProgram = RHIShaderProgramHandle.Invalid;
         m_FragmentProgram = RHIShaderProgramHandle.Invalid;
         m_VertexShaderAsset = CookedAssetHandle.Invalid;

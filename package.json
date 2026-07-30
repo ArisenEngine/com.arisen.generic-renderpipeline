@@ -18,7 +18,10 @@
   "services": {
     "provides": [
       "ArisenEngine.Rendering.IRenderMaterialLibrary",
-      "ArisenEngine.Rendering.IRenderPipelineProvider"
+      "ArisenEngine.Rendering.IRenderPipelineProvider",
+      "ArisenEngine.Rendering.IGenericRenderPipelineFeatureRegistry",
+      "ArisenEngine.Rendering.IGenericRenderPipelineRuntimeShaderRegistry",
+      "ArisenEngine.Rendering.Resources.IRHITexture2DResourceCache"
     ],
     "requires": [
       "ArisenEngine.Core.Assets.IAssetDatabase",

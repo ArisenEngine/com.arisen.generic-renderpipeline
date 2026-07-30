@@ -5,14 +5,16 @@ using ArisenEngine.Rendering.Resources;
 
 namespace ArisenEngine.Rendering;
 
-internal sealed class SharedRHITexture2DResourceCache : IRHITexture2DResourceCache, IDisposable
+public sealed class SharedRHITexture2DResourceCache : IRHITexture2DResourceCache, IDisposable
 {
     private readonly Dictionary<TextureKey, TextureEntry> m_Entries = new();
+    private readonly HashSet<TextureEntry> m_LiveEntries = new();
     private bool m_Disposed;
 
-    public int ResourceCount => m_Entries.Count;
+    public int ResourceCount => m_LiveEntries.Count;
 
-    public long EstimatedGpuBytes => m_Entries.Values.Sum(entry => entry.EstimatedGpuBytes);
+    public long EstimatedGpuBytes =>
+        m_LiveEntries.Sum(entry => entry.EstimatedGpuBytes);
 
     public IRHITexture2DLease Acquire(
         RHIDevice device,
@@ -22,7 +24,8 @@ internal sealed class SharedRHITexture2DResourceCache : IRHITexture2DResourceCac
     {
         if (m_Disposed) throw new ObjectDisposedException(nameof(SharedRHITexture2DResourceCache));
         var key = new TextureKey(asset.Guid, asset.Variant, samplerSettings);
-        if (!m_Entries.TryGetValue(key, out TextureEntry? entry))
+        if (!m_Entries.TryGetValue(key, out TextureEntry? entry) ||
+            entry.Resource.IsSourceStale())
         {
             var resource = new RHITexture2DResource(
                 device,
@@ -32,28 +35,34 @@ internal sealed class SharedRHITexture2DResourceCache : IRHITexture2DResourceCac
             entry = new TextureEntry(
                 resource,
                 checked((long)resource.Width * resource.Height * 4));
-            m_Entries.Add(key, entry);
+            m_Entries[key] = entry;
+            m_LiveEntries.Add(entry);
         }
 
         entry.ReferenceCount++;
-        return new TextureLease(this, key, entry.Resource);
+        return new TextureLease(this, key, entry);
     }
 
     public void Dispose()
     {
         if (m_Disposed) return;
-        foreach (TextureEntry entry in m_Entries.Values) entry.Resource.Dispose();
+        foreach (TextureEntry entry in m_LiveEntries) entry.Resource.Dispose();
+        m_LiveEntries.Clear();
         m_Entries.Clear();
         m_Disposed = true;
     }
 
-    private void Release(TextureKey key)
+    private void Release(TextureKey key, TextureEntry entry)
     {
-        if (m_Disposed || !m_Entries.TryGetValue(key, out TextureEntry? entry)) return;
+        if (m_Disposed) return;
         entry.ReferenceCount--;
         if (entry.ReferenceCount > 0) return;
-        m_Entries.Remove(key);
-        entry.Resource.Dispose();
+        if (m_Entries.TryGetValue(key, out TextureEntry? current) &&
+            ReferenceEquals(current, entry))
+        {
+            m_Entries.Remove(key);
+        }
+        if (m_LiveEntries.Remove(entry)) entry.Resource.Dispose();
     }
 
     private readonly record struct TextureKey(
@@ -78,25 +87,25 @@ internal sealed class SharedRHITexture2DResourceCache : IRHITexture2DResourceCac
     {
         private SharedRHITexture2DResourceCache? m_Owner;
         private readonly TextureKey m_Key;
-        private readonly RHITexture2DResource m_Resource;
+        private readonly TextureEntry m_Entry;
 
         public TextureLease(
             SharedRHITexture2DResourceCache owner,
             TextureKey key,
-            RHITexture2DResource resource)
+            TextureEntry entry)
         {
             m_Owner = owner;
             m_Key = key;
-            m_Resource = resource;
+            m_Entry = entry;
         }
 
-        public bool IsValid => m_Resource.IsValid;
-        public uint BindlessImageIndex => m_Resource.BindlessImageIndex;
-        public uint BindlessSamplerIndex => m_Resource.BindlessSamplerIndex;
+        public bool IsValid => m_Entry.Resource.IsValid;
+        public uint BindlessImageIndex => m_Entry.Resource.BindlessImageIndex;
+        public uint BindlessSamplerIndex => m_Entry.Resource.BindlessSamplerIndex;
 
         public void Dispose()
         {
-            Interlocked.Exchange(ref m_Owner, null)?.Release(m_Key);
+            Interlocked.Exchange(ref m_Owner, null)?.Release(m_Key, m_Entry);
         }
     }
 }
