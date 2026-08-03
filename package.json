@@ -2,6 +2,9 @@
   "id": "com.arisen.generic-renderpipeline",
   "name": "Arisen Generic RP",
   "version": "1.0.0",
+  "engine": {
+    "minVersion": "0.1.0"
+  },
   "layer": "domain",
   "author": "Arisen Team",
   "description": "Generic Rendering Pipeline for Arisen Engine",
