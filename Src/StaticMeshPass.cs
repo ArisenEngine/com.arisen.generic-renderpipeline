@@ -214,7 +214,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
 
         var colorImageView = GetColorTargetImageView(context);
 
-        if (context.FrameIndex % 60 == 0)
+        if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Passes))
         {
             Logger.Log(
                 $"[StaticMeshPass] RecordFallback | Surface: 0x{context.SurfaceId:X} | Size: {context.Width}x{context.Height} | Pipeline: {pipelineBatch.Pipeline.Index}:{pipelineBatch.Pipeline.Generation}");
@@ -281,13 +281,14 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             return;
         }
 
-        if (context.FrameIndex % 60 == 0 && workItem.DrawIndexStart == 0)
+        if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Passes) &&
+            workItem.DrawIndexStart == 0)
         {
             Logger.Log(
                 $"[StaticMeshPass] RecordDrawBatches | Surface: 0x{context.SurfaceId:X} | Draws: {m_PreparedDrawCount} | Batches: {m_DrawBatchCount} | WorkItems: {m_WorkItemCount}");
         }
 
-        if (context.FrameIndex % 60 == 0)
+        if (RenderDiagnostics.IsEnabled(RenderDiagnosticCategory.Passes))
         {
             LogBatchDrawCount(workItem);
         }

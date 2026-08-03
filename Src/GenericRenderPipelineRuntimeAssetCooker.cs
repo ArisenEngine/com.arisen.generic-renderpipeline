@@ -103,11 +103,10 @@ public static class GenericRenderPipelineSettingsCooker
                 $"[GenericRPSettingsCooker] Settings asset '{settingsRef.Guid:D}' is not indexed.");
         }
 
-        string outputPath = assetDatabase.GetCookedArtifactPath(
+        using CookedArtifactWrite write = assetDatabase.BeginCookedArtifactWrite(
             settingsRef.Guid,
             RuntimeVariant,
             CookedExtension);
-        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         byte[] nameBytes = Encoding.UTF8.GetBytes(settings.Name);
         if (nameBytes.Length > MaxNameBytes)
         {
@@ -115,7 +114,7 @@ public static class GenericRenderPipelineSettingsCooker
                 $"[GenericRPSettingsCooker] Settings name exceeds {MaxNameBytes} UTF-8 bytes.");
         }
 
-        using (var stream = File.Create(outputPath))
+        using (var stream = File.Create(write.OutputPath))
         using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: false))
         {
             writer.Write(s_Magic);
@@ -139,19 +138,12 @@ public static class GenericRenderPipelineSettingsCooker
             writer.Write(settings.Shadows.TerminalFadeFraction);
         }
 
-        var output = new FileInfo(outputPath);
-        assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
-            settingsRef.Guid,
-            sourceAsset.AssetType,
-            RuntimeVariant,
-            output.FullName,
-            output.Length,
-            output.LastWriteTimeUtc));
+        CookedAssetRecord output = write.Commit(sourceAsset.AssetType);
         return new CookedGenericRenderPipelineSettings(
             settingsRef.Guid,
             RuntimeVariant,
-            output.FullName,
-            output.Length);
+            output.Path,
+            output.SizeInBytes);
     }
 
     private static GenericRenderPipelineSettings ReadPayload(
