@@ -69,6 +69,24 @@ internal sealed class GenericRenderPipelineFeatureRegistryCore<TFeature>
         }
     }
 
+    public bool IsRegistered(TFeature feature)
+    {
+        ArgumentNullException.ThrowIfNull(feature);
+
+        lock (m_Gate)
+        {
+            foreach (Registration registration in m_Registrations.Values)
+            {
+                if (ReferenceEquals(registration.Feature, feature))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
     public bool Unregister(TFeature feature, string featureId)
     {
         ArgumentNullException.ThrowIfNull(feature);
