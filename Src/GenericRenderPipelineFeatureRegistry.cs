@@ -12,25 +12,26 @@ internal sealed class GenericRenderPipelineFeatureRegistry : IGenericRenderPipel
     public void Register(IGenericRenderPipelineFeature feature)
     {
         ArgumentNullException.ThrowIfNull(feature);
-        m_Core.Register(feature, feature.FeatureId, feature.Order);
         KernelLog.InfoFormat(
-            "[GenericRP.Features] Registered feature '{0}' at order {1}.",
+            "[GenericRP.Features] Registering feature '{0}' at order {1}.",
             feature.FeatureId,
             feature.Order);
+        m_Core.Register(feature, feature.FeatureId, feature.Order);
+    }
+
+    public bool IsRegistered(IGenericRenderPipelineFeature feature)
+    {
+        ArgumentNullException.ThrowIfNull(feature);
+        return m_Core.IsRegistered(feature);
     }
 
     public bool Unregister(IGenericRenderPipelineFeature feature)
     {
         ArgumentNullException.ThrowIfNull(feature);
-        bool removed = m_Core.Unregister(feature, feature.FeatureId);
-        if (removed)
-        {
-            KernelLog.InfoFormat(
-                "[GenericRP.Features] Unregistered feature '{0}'.",
-                feature.FeatureId);
-        }
-
-        return removed;
+        KernelLog.InfoFormat(
+            "[GenericRP.Features] Unregistering feature '{0}'.",
+            feature.FeatureId);
+        return m_Core.Unregister(feature, feature.FeatureId);
     }
 
     internal IGenericRenderPipelineFeature[] BeginPipelineActivation()
