@@ -8,29 +8,48 @@ using ArisenEngine.Resources.Serialization;
 
 namespace ArisenEngine.Rendering;
 
-public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
+public sealed class GenericPreparedAssetProvider :
+    IRuntimePreparedAssetProvider,
+    IGenericRenderPipelinePreparedAssetSource
 {
     public const string Id = "com.arisen.generic-renderpipeline.prepared-assets";
+
+    private static readonly Action<IDisposable> s_DisposeEnvironmentResource =
+        static resource => resource.Dispose();
 
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly GenericRenderMaterialLibrary m_MaterialLibrary;
     private readonly DeferredRenderResourceDisposalQueue m_DisposalQueue;
-    private readonly Dictionary<RuntimeAssetResidencyKey, RHIStaticMeshResource> m_Meshes = new();
-    private readonly HashSet<RuntimeAssetResidencyKey> m_Materials = new();
+    private readonly IRuntimeAssetResidencyService m_ResidencyService;
+    private readonly GenericPreparedAssetProviderLifecycleState m_LifecycleState = new();
+    private readonly Dictionary<RuntimeAssetResidencyKey, PreparedMeshEntry> m_Meshes = new();
+    private readonly Dictionary<RuntimeAssetResidencyKey, PreparedMaterialEntry> m_Materials = new();
+    private readonly HashSet<PreparedMeshEntry> m_RetiredMeshes =
+        new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<RuntimeAssetResidencyKey, PreparedEnvironment> m_Environments = new();
+    private readonly Action<IDisposable> m_DeferEnvironmentResource;
     private RHIDevice m_Device;
     private ulong m_DeviceGeneration;
     private ulong m_LastSubmittedTicket;
+    private ulong m_NextMeshPublicationGeneration;
+    private int m_PreparedMeshLeaseCount;
+    private int m_PreparedAssetThreadId;
+    private long m_RetiredMeshGpuBytes;
     private long m_EstimatedGpuBytes;
 
     public GenericPreparedAssetProvider(
         IAssetDatabase assetDatabase,
         GenericRenderMaterialLibrary materialLibrary,
-        DeferredRenderResourceDisposalQueue disposalQueue)
+        DeferredRenderResourceDisposalQueue disposalQueue,
+        IRuntimeAssetResidencyService residencyService)
     {
         m_AssetDatabase = assetDatabase ?? throw new ArgumentNullException(nameof(assetDatabase));
         m_MaterialLibrary = materialLibrary ?? throw new ArgumentNullException(nameof(materialLibrary));
         m_DisposalQueue = disposalQueue ?? throw new ArgumentNullException(nameof(disposalQueue));
+        m_ResidencyService = residencyService
+            ?? throw new ArgumentNullException(nameof(residencyService));
+        m_DeferEnvironmentResource = DeferEnvironmentResource;
+        PublishMetricsSnapshot();
     }
 
     public string ProviderId => Id;
@@ -40,6 +59,8 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
 
     public RuntimePreparedAssetResult Prepare(RuntimeAssetResidencyKey key)
     {
+        EnsurePreparedAssetThread();
+        DrainPendingReleases();
         if (!Supports(key.AssetType))
         {
             return RuntimePreparedAssetResult.Failed(
@@ -52,75 +73,134 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
                 "GenericRP is waiting for the first valid RHI frame context.");
         }
 
-        return key.AssetType switch
+        lock (m_LifecycleState.Gate)
         {
-            "Mesh" => PrepareMesh(key),
-            "Material" => PrepareMaterial(key),
-            "EnvironmentTexture" => PrepareEnvironment(key),
-            _ => throw new UnreachableException()
-        };
-    }
+            if (m_LifecycleState.IsReleasePendingLocked(key))
+            {
+                return RuntimePreparedAssetResult.Waiting(
+                    $"GenericRP is retiring the previous exact publication for '{key}'.");
+            }
 
-    public void Release(RuntimeAssetResidencyKey key)
-    {
-        if (m_Meshes.Remove(key, out RHIStaticMeshResource? mesh))
-        {
-            m_EstimatedGpuBytes -= EstimateMeshBytes(mesh);
-            m_DisposalQueue.Enqueue(mesh, m_LastSubmittedTicket);
-        }
-
-        if (m_Materials.Remove(key))
-        {
-            long bytes = GetCookedSize(key);
-            m_EstimatedGpuBytes = Math.Max(0, m_EstimatedGpuBytes - bytes);
-            m_MaterialLibrary.ReleasePrepared(key.Guid, m_LastSubmittedTicket);
-        }
-
-        if (m_Environments.Remove(key, out PreparedEnvironment? environment))
-        {
-            m_EstimatedGpuBytes = Math.Max(
-                0,
-                m_EstimatedGpuBytes - environment.EstimatedGpuBytes);
-            m_DisposalQueue.Enqueue(environment.Lighting, m_LastSubmittedTicket);
-            m_DisposalQueue.Enqueue(environment.Texture, m_LastSubmittedTicket);
+            try
+            {
+                return key.AssetType switch
+                {
+                    "Mesh" => PrepareMesh(key),
+                    "Material" => PrepareMaterial(key),
+                    "EnvironmentTexture" => PrepareEnvironment(key),
+                    _ => throw new UnreachableException()
+                };
+            }
+            finally
+            {
+                PublishMetricsSnapshot();
+            }
         }
     }
 
-    public RuntimePreparedAssetProviderMetrics GetMetrics() => new(
-        m_Meshes.Count + m_Materials.Count + m_Environments.Count +
-            m_MaterialLibrary.PreparedTextureCount,
-        m_EstimatedGpuBytes + m_MaterialLibrary.EstimatedTextureGpuBytes,
-        m_DisposalQueue.PendingCount,
-        m_MaterialLibrary.PreparedMaterialCount);
+    public void Release(RuntimeAssetResidencyKey key) =>
+        m_LifecycleState.RequestRelease(key);
+
+    public RuntimePreparedAssetProviderMetrics GetMetrics() =>
+        m_LifecycleState.ReadMetrics();
 
     public ulong UpdateFrameContext(
         RHIDevice device,
         ulong deviceGeneration,
         ulong lastSubmittedTicket)
     {
+        BindPreparedAssetThread();
+        m_LastSubmittedTicket = Math.Max(m_LastSubmittedTicket, lastSubmittedTicket);
+        DrainPendingReleases();
         if (device.IsValid)
         {
             m_DisposalQueue.BindDevice(device, deviceGeneration);
             m_Device = device;
             m_DeviceGeneration = deviceGeneration;
         }
-        m_LastSubmittedTicket = Math.Max(m_LastSubmittedTicket, lastSubmittedTicket);
+        PublishMetricsSnapshot();
         return m_LastSubmittedTicket;
     }
 
     public void UpdateSubmittedTicket(ulong submittedTicket)
     {
+        EnsurePreparedAssetThread();
         m_LastSubmittedTicket = Math.Max(m_LastSubmittedTicket, submittedTicket);
+        DrainPendingReleases();
+        PublishMetricsSnapshot();
     }
 
-    public bool TryGetMesh(Guid meshGuid, out RHIStaticMeshResource mesh)
+    public bool TryAcquirePreparedMesh(
+        in RuntimeAssetResidencyKey key,
+        out IGenericRenderPipelinePreparedMeshLease lease)
     {
-        foreach ((RuntimeAssetResidencyKey key, RHIStaticMeshResource resource) in m_Meshes)
+        BindPreparedAssetThread();
+        DrainPendingReleases();
+        lock (m_LifecycleState.Gate)
         {
-            if (key.Guid == meshGuid && resource.IsValid)
+            if (!m_LifecycleState.IsReleasePendingLocked(key) &&
+                m_Meshes.TryGetValue(key, out PreparedMeshEntry? entry) &&
+                entry.IsCurrent &&
+                entry.DeviceGeneration == m_DeviceGeneration &&
+                entry.Resource.IsValid)
             {
-                mesh = resource;
+                entry.LeaseCount = checked(entry.LeaseCount + 1);
+                m_PreparedMeshLeaseCount = checked(m_PreparedMeshLeaseCount + 1);
+                lease = new PreparedMeshLease(this, entry);
                 return true;
+            }
+        }
+
+        lease = null!;
+        return false;
+    }
+
+    public bool TryAcquirePreparedMaterial(
+        in RuntimeAssetResidencyKey key,
+        out IGenericRenderPipelinePreparedMaterialLease lease)
+    {
+        BindPreparedAssetThread();
+        DrainPendingReleases();
+        lock (m_LifecycleState.Gate)
+        {
+            if (!m_LifecycleState.IsReleasePendingLocked(key) &&
+                m_Materials.TryGetValue(key, out PreparedMaterialEntry? entry) &&
+                entry.DeviceGeneration == m_DeviceGeneration &&
+                m_MaterialLibrary.TryAcquirePreparedMaterial(
+                    key.Guid,
+                    out GenericRenderMaterialLibrary.PreparedMaterialLease materialLease))
+            {
+                if (ReferenceEquals(entry.Resource, materialLease.Resource) &&
+                    entry.PublicationGeneration == materialLease.PublicationGeneration)
+                {
+                    lease = new PreparedMaterialLease(this, entry, materialLease);
+                    return true;
+                }
+
+                materialLease.Dispose();
+            }
+        }
+
+        lease = null!;
+        return false;
+    }
+
+    internal bool TryGetMesh(Guid meshGuid, out RHIStaticMeshResource mesh)
+    {
+        EnsurePreparedAssetThread();
+        DrainPendingReleases();
+        lock (m_LifecycleState.Gate)
+        {
+            foreach ((RuntimeAssetResidencyKey key, PreparedMeshEntry entry) in m_Meshes)
+            {
+                if (!m_LifecycleState.IsReleasePendingLocked(key) &&
+                    key.Guid == meshGuid &&
+                    entry.IsCurrent &&
+                    entry.Resource.IsValid)
+                {
+                    mesh = entry.Resource;
+                    return true;
+                }
             }
         }
 
@@ -133,15 +213,21 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
         out RHIEnvironmentTextureResource texture,
         out RHIEnvironmentLightingResource lighting)
     {
-        foreach ((RuntimeAssetResidencyKey key, PreparedEnvironment environment) in m_Environments)
+        EnsurePreparedAssetThread();
+        lock (m_LifecycleState.Gate)
         {
-            if (key.Guid == environmentGuid &&
-                environment.Texture.IsValid &&
-                environment.Lighting.IsValid)
+            foreach ((RuntimeAssetResidencyKey key, PreparedEnvironment environment) in m_Environments)
             {
-                texture = environment.Texture;
-                lighting = environment.Lighting;
-                return true;
+                if (!m_LifecycleState.IsReleasePendingLocked(key) &&
+                    key.Guid == environmentGuid &&
+                    environment.IsCurrent &&
+                    environment.Texture.IsValid &&
+                    environment.Lighting.IsValid)
+                {
+                    texture = environment.Texture;
+                    lighting = environment.Lighting;
+                    return true;
+                }
             }
         }
 
@@ -152,95 +238,153 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
 
     public void InvalidateByAssetGuids(ReadOnlySpan<Guid> dirtyGuids)
     {
+        EnsurePreparedAssetThread();
+        DrainPendingReleases();
         if (dirtyGuids.IsEmpty) return;
-        var meshKeys = new List<RuntimeAssetResidencyKey>();
-        foreach (RuntimeAssetResidencyKey key in m_Meshes.Keys)
-        {
-            if (ContainsGuid(dirtyGuids, key.Guid)) meshKeys.Add(key);
-        }
-        foreach (RuntimeAssetResidencyKey key in meshKeys) Release(key);
 
-        var environmentKeys = new List<RuntimeAssetResidencyKey>();
-        foreach (RuntimeAssetResidencyKey key in m_Environments.Keys)
+        try
         {
-            if (ContainsGuid(dirtyGuids, key.Guid)) environmentKeys.Add(key);
+            m_MaterialLibrary.InvalidateByAssetGuids(dirtyGuids, m_LastSubmittedTicket);
+            if (!m_ResidencyService.IsPreparedProviderRegistered(this))
+            {
+                throw new InvalidOperationException(
+                    "GenericRP cannot invalidate prepared assets after its residency provider was unregistered.");
+            }
+            if (!m_ResidencyService.InvalidatePreparedProvider(
+                    Id,
+                    "Generic RP prepared resources were invalidated by an asset dependency change."))
+            {
+                throw new InvalidOperationException(
+                    "GenericRP residency provider disappeared during asset invalidation.");
+            }
+
+            DrainPendingReleases();
         }
-        foreach (RuntimeAssetResidencyKey key in environmentKeys) Release(key);
+        finally
+        {
+            PublishMetricsSnapshot();
+        }
     }
 
     public void ReleaseAll(bool disposeImmediately)
     {
-        foreach (RHIStaticMeshResource mesh in m_Meshes.Values)
+        EnsurePreparedAssetThread();
+        lock (m_LifecycleState.Gate)
         {
-            if (disposeImmediately) mesh.Dispose();
-            else m_DisposalQueue.Enqueue(mesh, m_LastSubmittedTicket);
-        }
-
-        foreach (RuntimeAssetResidencyKey material in m_Materials)
-        {
-            m_MaterialLibrary.ReleasePrepared(
-                material.Guid,
-                m_LastSubmittedTicket,
-                disposeImmediately);
-        }
-
-        foreach (PreparedEnvironment environment in m_Environments.Values)
-        {
-            if (disposeImmediately)
+            DrainPendingReleases();
+            try
             {
-                environment.Lighting.Dispose();
-                environment.Texture.Dispose();
+                if (disposeImmediately &&
+                    (m_PreparedMeshLeaseCount != 0 ||
+                     m_MaterialLibrary.PreparedPublicationLeaseCount != 0))
+                {
+                    throw new InvalidOperationException(
+                        $"GenericRP cannot force device-resource release while " +
+                        $"{m_PreparedMeshLeaseCount} mesh and " +
+                        $"{m_MaterialLibrary.PreparedPublicationLeaseCount} material " +
+                        "publication leases remain active.");
+                }
+
+                RuntimeAssetResidencyKey[] meshKeys = m_Meshes.Keys.ToArray();
+                for (int index = 0; index < meshKeys.Length; index++)
+                {
+                    RuntimeAssetResidencyKey key = meshKeys[index];
+                    PreparedMeshEntry mesh = m_Meshes[key];
+                    long bytes = EstimateMeshBytes(mesh.Resource);
+                    RetirePreparedMesh(mesh, disposeImmediately);
+                    m_Meshes.Remove(key);
+                    m_EstimatedGpuBytes = Math.Max(0, m_EstimatedGpuBytes - bytes);
+                }
+
+                RuntimeAssetResidencyKey[] materialKeys = m_Materials.Keys.ToArray();
+                for (int index = 0; index < materialKeys.Length; index++)
+                {
+                    RuntimeAssetResidencyKey key = materialKeys[index];
+                    PreparedMaterialEntry material = m_Materials[key];
+                    m_MaterialLibrary.ReleasePrepared(
+                        material.Key.Guid,
+                        material.Resource,
+                        material.PublicationGeneration,
+                        m_LastSubmittedTicket,
+                        disposeImmediately);
+                    RemovePreparedMaterialMapping(key);
+                }
+
+                RuntimeAssetResidencyKey[] environmentKeys =
+                    m_Environments.Keys.ToArray();
+                Action<IDisposable> retireEnvironmentResource = disposeImmediately
+                    ? s_DisposeEnvironmentResource
+                    : m_DeferEnvironmentResource;
+                for (int index = 0; index < environmentKeys.Length; index++)
+                {
+                    RuntimeAssetResidencyKey key = environmentKeys[index];
+                    PreparedEnvironment environment = m_Environments[key];
+                    environment.TransferRetirementOwnership(retireEnvironmentResource);
+                    RemovePreparedEnvironment(key, environment);
+                }
+
+                m_EstimatedGpuBytes = 0;
             }
-            else
+            finally
             {
-                m_DisposalQueue.Enqueue(environment.Lighting, m_LastSubmittedTicket);
-                m_DisposalQueue.Enqueue(environment.Texture, m_LastSubmittedTicket);
+                PublishMetricsSnapshot();
             }
         }
-
-        m_Meshes.Clear();
-        m_Materials.Clear();
-        m_Environments.Clear();
-        m_EstimatedGpuBytes = 0;
     }
 
     public void ReleaseDevice()
     {
-        if (m_Meshes.Count != 0 ||
-            m_Materials.Count != 0 ||
-            m_Environments.Count != 0)
+        EnsurePreparedAssetThread();
+        lock (m_LifecycleState.Gate)
         {
-            throw new InvalidOperationException(
-                "GenericRP cannot release its RHI device while prepared resources remain.");
-        }
+            DrainPendingReleases();
+            if (m_LifecycleState.PendingReleaseCount != 0 ||
+                m_Meshes.Count != 0 ||
+                m_Materials.Count != 0 ||
+                m_Environments.Count != 0 ||
+                m_RetiredMeshes.Count != 0 ||
+                m_PreparedMeshLeaseCount != 0 ||
+                m_MaterialLibrary.PreparedPublicationLeaseCount != 0)
+            {
+                throw new InvalidOperationException(
+                    "GenericRP cannot release its RHI device while prepared resources, " +
+                    "pending lifecycle releases, or exact-publication leases remain.");
+            }
 
-        if (m_Device.IsValid)
-        {
-            m_DisposalQueue.ReleaseDevice(
-                m_Device,
-                m_DeviceGeneration,
-                m_LastSubmittedTicket);
-        }
-        else if (m_DisposalQueue.PendingCount != 0)
-        {
-            throw new InvalidOperationException(
-                $"GenericRP cannot release {m_DisposalQueue.PendingCount} deferred resources without a valid RHI device.");
-        }
+            if (m_Device.IsValid)
+            {
+                m_DisposalQueue.ReleaseDevice(
+                    m_Device,
+                    m_DeviceGeneration,
+                    m_LastSubmittedTicket);
+            }
+            else if (m_DisposalQueue.PendingCount != 0)
+            {
+                throw new InvalidOperationException(
+                    $"GenericRP cannot release {m_DisposalQueue.PendingCount} deferred resources without a valid RHI device.");
+            }
 
-        m_Device = default;
-        m_DeviceGeneration = 0;
-        m_LastSubmittedTicket = 0;
+            m_Device = default;
+            m_DeviceGeneration = 0;
+            m_LastSubmittedTicket = 0;
+            PublishMetricsSnapshot();
+            Volatile.Write(ref m_PreparedAssetThreadId, 0);
+        }
     }
 
     public void ReleaseAllDeviceResources()
     {
-        if (m_Device.IsValid && m_LastSubmittedTicket != 0)
+        EnsurePreparedAssetThread();
+        lock (m_LifecycleState.Gate)
         {
-            m_Device.WaitQueueTicket(m_LastSubmittedTicket);
-        }
+            if (m_Device.IsValid && m_LastSubmittedTicket != 0)
+            {
+                m_Device.WaitQueueTicket(m_LastSubmittedTicket);
+            }
 
-        ReleaseAll(disposeImmediately: true);
-        ReleaseDevice();
+            ReleaseAll(disposeImmediately: true);
+            ReleaseDevice();
+        }
     }
 
     private RuntimePreparedAssetResult PrepareMesh(RuntimeAssetResidencyKey key)
@@ -251,10 +395,20 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
                 $"GenericRP mesh variant '{key.Variant}' is unsupported.");
         }
 
-        if (m_Meshes.TryGetValue(key, out RHIStaticMeshResource? existing))
+        foreach (RuntimeAssetResidencyKey preparedKey in m_Meshes.Keys)
         {
-            return existing.IsValid
-                ? RuntimePreparedAssetResult.Ready(EstimateMeshBytes(existing))
+            if (preparedKey.Guid == key.Guid && preparedKey != key)
+            {
+                return RuntimePreparedAssetResult.Failed(
+                    $"GenericRP refuses to alias mesh GUID '{key.Guid:D}' across exact " +
+                    $"residency keys '{preparedKey}' and '{key}'.");
+            }
+        }
+
+        if (m_Meshes.TryGetValue(key, out PreparedMeshEntry? existing))
+        {
+            return existing.IsCurrent && existing.Resource.IsValid
+                ? RuntimePreparedAssetResult.Ready(EstimateMeshBytes(existing.Resource))
                 : RuntimePreparedAssetResult.Failed(
                     $"Prepared mesh '{key}' no longer owns valid RHI buffers.");
         }
@@ -269,7 +423,13 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
         }
 
         long bytes = EstimateMeshBytes(mesh);
-        m_Meshes.Add(key, mesh);
+        m_Meshes.Add(
+            key,
+            new PreparedMeshEntry(
+                key,
+                mesh,
+                m_DeviceGeneration,
+                NextMeshPublicationGeneration()));
         m_EstimatedGpuBytes += bytes;
         return RuntimePreparedAssetResult.Ready(bytes);
     }
@@ -282,24 +442,80 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
                 $"GenericRP material variant '{key.Variant}' is unsupported.");
         }
 
-        if (m_Materials.Contains(key) &&
-            m_MaterialLibrary.TryGetPreparedMaterial(key.Guid, out _))
+        foreach (RuntimeAssetResidencyKey preparedKey in m_Materials.Keys)
         {
-            return RuntimePreparedAssetResult.Ready(GetCookedSize(key));
+            if (preparedKey.Guid == key.Guid && preparedKey != key)
+            {
+                return RuntimePreparedAssetResult.Failed(
+                    $"GenericRP refuses to alias material GUID '{key.Guid:D}' across exact " +
+                    $"residency keys '{preparedKey}' and '{key}'.");
+            }
         }
+
+        if (m_Materials.TryGetValue(key, out PreparedMaterialEntry? existing) &&
+            existing.DeviceGeneration == m_DeviceGeneration &&
+            m_MaterialLibrary.TryAcquirePreparedMaterial(
+                key.Guid,
+                out GenericRenderMaterialLibrary.PreparedMaterialLease existingLease))
+        {
+            try
+            {
+                if (ReferenceEquals(existing.Resource, existingLease.Resource) &&
+                    existing.PublicationGeneration == existingLease.PublicationGeneration)
+                {
+                    return RuntimePreparedAssetResult.Ready(GetCookedSize(key));
+                }
+            }
+            finally
+            {
+                existingLease.Dispose();
+            }
+        }
+
+        RemovePreparedMaterialMapping(key);
 
         uint materialId = m_MaterialLibrary.RegisterMaterial(
             new AssetRef<MaterialSourceAsset>(key.Guid, key.AssetType, key.PackageId));
-        m_MaterialLibrary.EnsurePrepared(m_Device, materialId, m_LastSubmittedTicket);
-        if (!m_MaterialLibrary.TryGetPreparedMaterial(key.Guid, out _))
+        Guid staleMaterialGuid = m_MaterialLibrary.EnsurePrepared(
+            m_Device,
+            materialId,
+            m_LastSubmittedTicket);
+        if (staleMaterialGuid != Guid.Empty)
+        {
+            return RuntimePreparedAssetResult.Waiting(
+                $"GenericRP material '{key}' changed after residency setup began; " +
+                "the setup coordinator must invalidate its current publication before replacement.");
+        }
+        if (!m_MaterialLibrary.TryAcquirePreparedMaterial(
+                key.Guid,
+                out GenericRenderMaterialLibrary.PreparedMaterialLease materialLease))
         {
             return RuntimePreparedAssetResult.Failed(
                 $"GenericRP material '{key}' did not become ready after preparation.");
         }
 
-        long bytes = GetCookedSize(key);
-        if (m_Materials.Add(key)) m_EstimatedGpuBytes += bytes;
-        return RuntimePreparedAssetResult.Ready(bytes);
+        try
+        {
+            long bytes = GetCookedSize(key);
+            m_MaterialLibrary.SetPreparedPublicationEstimatedGpuBytes(
+                materialLease.Resource,
+                materialLease.PublicationGeneration,
+                bytes);
+            m_Materials.Add(
+                key,
+                new PreparedMaterialEntry(
+                    key,
+                    materialLease.Resource,
+                    m_DeviceGeneration,
+                    materialLease.PublicationGeneration,
+                    bytes));
+            m_EstimatedGpuBytes += bytes;
+            return RuntimePreparedAssetResult.Ready(bytes);
+        }
+        finally
+        {
+            materialLease.Dispose();
+        }
     }
 
     private RuntimePreparedAssetResult PrepareEnvironment(RuntimeAssetResidencyKey key)
@@ -313,8 +529,24 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
                 $"GenericRP environment variant '{key.Variant}' is unsupported.");
         }
 
+        foreach (RuntimeAssetResidencyKey preparedKey in m_Environments.Keys)
+        {
+            if (preparedKey.Guid == key.Guid && preparedKey != key)
+            {
+                return RuntimePreparedAssetResult.Failed(
+                    $"GenericRP refuses to alias environment GUID '{key.Guid:D}' across " +
+                    $"exact residency keys '{preparedKey}' and '{key}'.");
+            }
+        }
+
         if (m_Environments.TryGetValue(key, out PreparedEnvironment? existing))
         {
+            if (!existing.IsCurrent)
+            {
+                return RuntimePreparedAssetResult.Waiting(
+                    $"Prepared environment '{key}' is still retiring its previous publication.");
+            }
+
             return existing.Texture.IsValid && existing.Lighting.IsValid
                 ? RuntimePreparedAssetResult.Ready(existing.EstimatedGpuBytes)
                 : RuntimePreparedAssetResult.Failed(
@@ -373,6 +605,101 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
             : 0;
     }
 
+    private void DrainPendingReleases()
+    {
+        EnsurePreparedAssetThread();
+        while (m_LifecycleState.TryPeekPendingRelease(out RuntimeAssetResidencyKey key))
+        {
+            try
+            {
+                ReleasePhysicalResources(key);
+                RuntimePreparedAssetProviderMetrics physicalMetrics =
+                    CapturePhysicalMetrics();
+                m_LifecycleState.CompletePendingRelease(key, physicalMetrics);
+            }
+            catch
+            {
+                PublishMetricsSnapshot();
+                throw;
+            }
+        }
+    }
+
+    private void ReleasePhysicalResources(RuntimeAssetResidencyKey key)
+    {
+        if (m_Meshes.TryGetValue(key, out PreparedMeshEntry? mesh))
+        {
+            long bytes = EstimateMeshBytes(mesh.Resource);
+            RetirePreparedMesh(mesh, disposeImmediately: false);
+            m_Meshes.Remove(key);
+            m_EstimatedGpuBytes = Math.Max(0, m_EstimatedGpuBytes - bytes);
+        }
+
+        if (m_Materials.TryGetValue(key, out PreparedMaterialEntry? material))
+        {
+            m_MaterialLibrary.ReleasePrepared(
+                material.Key.Guid,
+                material.Resource,
+                material.PublicationGeneration,
+                m_LastSubmittedTicket);
+            RemovePreparedMaterialMapping(key);
+        }
+
+        if (m_Environments.TryGetValue(key, out PreparedEnvironment? environment))
+        {
+            environment.TransferRetirementOwnership(m_DeferEnvironmentResource);
+            RemovePreparedEnvironment(key, environment);
+        }
+    }
+
+    private RuntimePreparedAssetProviderMetrics CapturePhysicalMetrics() =>
+        new(
+            m_Meshes.Count + m_Materials.Count + m_Environments.Count +
+                m_MaterialLibrary.PreparedTextureCount,
+            m_EstimatedGpuBytes + m_RetiredMeshGpuBytes +
+                m_MaterialLibrary.RetiredPreparedPublicationGpuBytes +
+                m_MaterialLibrary.EstimatedTextureGpuBytes,
+            m_DisposalQueue.PendingCount + m_RetiredMeshes.Count +
+                m_MaterialLibrary.RetiredPreparedPublicationCount,
+            m_MaterialLibrary.PreparedMaterialCount +
+                m_MaterialLibrary.RetiredPreparedPublicationCount);
+
+    private void PublishMetricsSnapshot() =>
+        m_LifecycleState.PublishPhysicalMetrics(CapturePhysicalMetrics());
+
+    private void RemovePreparedMaterialMapping(RuntimeAssetResidencyKey key)
+    {
+        if (!m_Materials.Remove(key, out PreparedMaterialEntry? entry))
+        {
+            return;
+        }
+
+        m_EstimatedGpuBytes = Math.Max(
+            0,
+            m_EstimatedGpuBytes - entry.EstimatedGpuBytes);
+    }
+
+    private void RemovePreparedEnvironment(
+        RuntimeAssetResidencyKey key,
+        PreparedEnvironment environment)
+    {
+        if (!environment.RetirementComplete ||
+            !m_Environments.TryGetValue(key, out PreparedEnvironment? current) ||
+            !ReferenceEquals(current, environment) ||
+            !m_Environments.Remove(key))
+        {
+            throw new InvalidOperationException(
+                $"Prepared environment retirement ownership was lost for '{key}'.");
+        }
+
+        m_EstimatedGpuBytes = Math.Max(
+            0,
+            m_EstimatedGpuBytes - environment.EstimatedGpuBytes);
+    }
+
+    private void DeferEnvironmentResource(IDisposable resource) =>
+        m_DisposalQueue.Enqueue(resource, m_LastSubmittedTicket);
+
     private static long EstimateMeshBytes(RHIStaticMeshResource mesh) =>
         checked((long)mesh.VertexCount * mesh.VertexStride + (long)mesh.IndexCount * sizeof(uint));
 
@@ -389,18 +716,364 @@ public sealed class GenericPreparedAssetProvider : IRuntimePreparedAssetProvider
         };
     }
 
-    private static bool ContainsGuid(ReadOnlySpan<Guid> guids, Guid guid)
+    private void BindPreparedAssetThread()
     {
-        for (int index = 0; index < guids.Length; index++)
+        int currentThreadId = Environment.CurrentManagedThreadId;
+        int ownerThreadId = Volatile.Read(ref m_PreparedAssetThreadId);
+        if (ownerThreadId == 0)
         {
-            if (guids[index] == guid) return true;
+            ownerThreadId = Interlocked.CompareExchange(
+                ref m_PreparedAssetThreadId,
+                currentThreadId,
+                comparand: 0);
+            if (ownerThreadId == 0)
+            {
+                ownerThreadId = currentThreadId;
+            }
         }
 
-        return false;
+        if (ownerThreadId != currentThreadId)
+        {
+            throw new InvalidOperationException(
+                $"GenericRP prepared assets are setup-thread affine to thread " +
+                $"{ownerThreadId}; thread {currentThreadId} attempted access.");
+        }
     }
 
-    private sealed record PreparedEnvironment(
-        RHIEnvironmentTextureResource Texture,
-        RHIEnvironmentLightingResource Lighting,
-        long EstimatedGpuBytes);
+    private void EnsurePreparedAssetThread()
+    {
+        int ownerThreadId = Volatile.Read(ref m_PreparedAssetThreadId);
+        if (ownerThreadId != 0 && ownerThreadId != Environment.CurrentManagedThreadId)
+        {
+            throw new InvalidOperationException(
+                $"GenericRP prepared assets are setup-thread affine to thread " +
+                $"{ownerThreadId}; thread {Environment.CurrentManagedThreadId} attempted access.");
+        }
+    }
+
+    private ulong NextMeshPublicationGeneration()
+    {
+        m_NextMeshPublicationGeneration = checked(m_NextMeshPublicationGeneration + 1);
+        return m_NextMeshPublicationGeneration;
+    }
+
+    private void RetirePreparedMesh(
+        PreparedMeshEntry entry,
+        bool disposeImmediately)
+    {
+        if (!entry.IsCurrent || entry.Released)
+        {
+            throw new InvalidOperationException(
+                $"Prepared mesh publication {entry.PublicationGeneration} for " +
+                $"'{entry.Key}' is already retired.");
+        }
+
+        if (entry.LeaseCount == 0)
+        {
+            entry.IsCurrent = false;
+            try
+            {
+                DisposePreparedMesh(
+                    entry.Resource,
+                    disposeImmediately,
+                    m_LastSubmittedTicket);
+            }
+            catch
+            {
+                entry.IsCurrent = true;
+                throw;
+            }
+
+            entry.Released = true;
+            return;
+        }
+
+        if (disposeImmediately)
+        {
+            throw new InvalidOperationException(
+                $"Cannot immediately release prepared mesh publication " +
+                $"{entry.PublicationGeneration} for '{entry.Key}' while " +
+                $"{entry.LeaseCount} leases remain active.");
+        }
+
+        entry.IsCurrent = false;
+        entry.RetirementTicket = m_LastSubmittedTicket;
+        try
+        {
+            if (!m_RetiredMeshes.Add(entry))
+            {
+                throw new InvalidOperationException(
+                    "Prepared mesh publication was already tracked as retired.");
+            }
+            m_RetiredMeshGpuBytes = checked(
+                m_RetiredMeshGpuBytes + EstimateMeshBytes(entry.Resource));
+        }
+        catch
+        {
+            m_RetiredMeshes.Remove(entry);
+            entry.RetirementTicket = 0;
+            entry.IsCurrent = true;
+            throw;
+        }
+    }
+
+    private void ReleasePreparedMeshLease(PreparedMeshEntry entry)
+    {
+        EnsurePreparedAssetThread();
+        if (entry.LeaseCount <= 0 || m_PreparedMeshLeaseCount <= 0 || entry.Released)
+        {
+            throw new InvalidOperationException(
+                "Prepared mesh lease ownership is invalid.");
+        }
+
+        if (entry.LeaseCount == 1 && !entry.IsCurrent)
+        {
+            if (!m_RetiredMeshes.Contains(entry))
+            {
+                throw new InvalidOperationException(
+                    "Retired prepared mesh publication was not tracked by its provider.");
+            }
+
+            ulong retirementTicket = Math.Max(
+                entry.RetirementTicket,
+                m_LastSubmittedTicket);
+            DisposePreparedMesh(
+                entry.Resource,
+                disposeImmediately: false,
+                submittedTicket: retirementTicket);
+            if (!m_RetiredMeshes.Remove(entry))
+            {
+                throw new InvalidOperationException(
+                    "Retired prepared mesh publication was not tracked by its provider.");
+            }
+
+            m_RetiredMeshGpuBytes = Math.Max(
+                0,
+                m_RetiredMeshGpuBytes - EstimateMeshBytes(entry.Resource));
+            entry.Released = true;
+        }
+
+        entry.LeaseCount--;
+        m_PreparedMeshLeaseCount--;
+        PublishMetricsSnapshot();
+    }
+
+    private bool IsPreparedMeshCurrent(PreparedMeshEntry entry)
+    {
+        EnsurePreparedAssetThread();
+        lock (m_LifecycleState.Gate)
+        {
+            return !m_LifecycleState.IsReleasePendingLocked(entry.Key) &&
+                entry.IsCurrent &&
+                !entry.Released &&
+                entry.DeviceGeneration == m_DeviceGeneration &&
+                m_Meshes.TryGetValue(entry.Key, out PreparedMeshEntry? current) &&
+                ReferenceEquals(current, entry);
+        }
+    }
+
+    private bool IsPreparedMaterialCurrent(
+        PreparedMaterialEntry entry,
+        GenericRenderMaterialLibrary.PreparedMaterialLease lease)
+    {
+        EnsurePreparedAssetThread();
+        lock (m_LifecycleState.Gate)
+        {
+            return !m_LifecycleState.IsReleasePendingLocked(entry.Key) &&
+                entry.DeviceGeneration == m_DeviceGeneration &&
+                m_Materials.TryGetValue(entry.Key, out PreparedMaterialEntry? current) &&
+                ReferenceEquals(current, entry) &&
+                ReferenceEquals(entry.Resource, lease.Resource) &&
+                entry.PublicationGeneration == lease.PublicationGeneration &&
+                lease.IsCurrent;
+        }
+    }
+
+    private void ReleasePreparedMaterialLease(
+        GenericRenderMaterialLibrary.PreparedMaterialLease lease)
+    {
+        EnsurePreparedAssetThread();
+        lease.Dispose();
+        PublishMetricsSnapshot();
+    }
+
+    private void DisposePreparedMesh(
+        RHIStaticMeshResource resource,
+        bool disposeImmediately,
+        ulong submittedTicket)
+    {
+        if (disposeImmediately)
+        {
+            resource.Dispose();
+        }
+        else
+        {
+            m_DisposalQueue.Enqueue(resource, submittedTicket);
+        }
+    }
+
+    private sealed class PreparedMeshEntry
+    {
+        public PreparedMeshEntry(
+            RuntimeAssetResidencyKey key,
+            RHIStaticMeshResource resource,
+            ulong deviceGeneration,
+            ulong publicationGeneration)
+        {
+            Key = key;
+            Resource = resource;
+            DeviceGeneration = deviceGeneration;
+            PublicationGeneration = publicationGeneration;
+        }
+
+        public RuntimeAssetResidencyKey Key { get; }
+        public RHIStaticMeshResource Resource { get; }
+        public ulong DeviceGeneration { get; }
+        public ulong PublicationGeneration { get; }
+        public int LeaseCount { get; set; }
+        public bool IsCurrent { get; set; } = true;
+        public bool Released { get; set; }
+        public ulong RetirementTicket { get; set; }
+    }
+
+    private sealed class PreparedMaterialEntry
+    {
+        public PreparedMaterialEntry(
+            RuntimeAssetResidencyKey key,
+            RHIMaterialResource resource,
+            ulong deviceGeneration,
+            ulong publicationGeneration,
+            long estimatedGpuBytes)
+        {
+            Key = key;
+            Resource = resource;
+            DeviceGeneration = deviceGeneration;
+            PublicationGeneration = publicationGeneration;
+            EstimatedGpuBytes = estimatedGpuBytes;
+        }
+
+        public RuntimeAssetResidencyKey Key { get; }
+        public RHIMaterialResource Resource { get; }
+        public ulong DeviceGeneration { get; }
+        public ulong PublicationGeneration { get; }
+        public long EstimatedGpuBytes { get; }
+    }
+
+    private sealed class PreparedMeshLease : IGenericRenderPipelinePreparedMeshLease
+    {
+        private readonly object m_DisposeGate = new();
+        private GenericPreparedAssetProvider? m_Owner;
+        private readonly PreparedMeshEntry m_Entry;
+
+        public PreparedMeshLease(
+            GenericPreparedAssetProvider owner,
+            PreparedMeshEntry entry)
+        {
+            m_Owner = owner;
+            m_Entry = entry;
+        }
+
+        public RuntimeAssetResidencyKey Key => m_Entry.Key;
+        public ulong DeviceGeneration => m_Entry.DeviceGeneration;
+        public ulong PublicationGeneration => m_Entry.PublicationGeneration;
+        public RHIStaticMeshResource Resource => m_Entry.Resource;
+        public bool IsCurrent =>
+            Volatile.Read(ref m_Owner)?.IsPreparedMeshCurrent(m_Entry) == true;
+
+        public void Dispose()
+        {
+            lock (m_DisposeGate)
+            {
+                GenericPreparedAssetProvider? owner = m_Owner;
+                if (owner == null)
+                {
+                    return;
+                }
+
+                owner.ReleasePreparedMeshLease(m_Entry);
+                m_Owner = null;
+            }
+        }
+    }
+
+    private sealed class PreparedMaterialLease :
+        IGenericRenderPipelinePreparedMaterialLease
+    {
+        private readonly object m_DisposeGate = new();
+        private GenericPreparedAssetProvider? m_Owner;
+        private GenericRenderMaterialLibrary.PreparedMaterialLease? m_Lease;
+        private readonly PreparedMaterialEntry m_Entry;
+
+        public PreparedMaterialLease(
+            GenericPreparedAssetProvider owner,
+            PreparedMaterialEntry entry,
+            GenericRenderMaterialLibrary.PreparedMaterialLease lease)
+        {
+            m_Owner = owner;
+            m_Entry = entry;
+            m_Lease = lease;
+        }
+
+        public RuntimeAssetResidencyKey Key => m_Entry.Key;
+        public ulong DeviceGeneration => m_Entry.DeviceGeneration;
+        public ulong PublicationGeneration => m_Entry.PublicationGeneration;
+        public RHIMaterialResource Resource => m_Entry.Resource;
+        public bool IsCurrent
+        {
+            get
+            {
+                GenericPreparedAssetProvider? owner = Volatile.Read(ref m_Owner);
+                GenericRenderMaterialLibrary.PreparedMaterialLease? lease =
+                    Volatile.Read(ref m_Lease);
+                return lease != null &&
+                    owner?.IsPreparedMaterialCurrent(m_Entry, lease) == true;
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (m_DisposeGate)
+            {
+                GenericRenderMaterialLibrary.PreparedMaterialLease? lease = m_Lease;
+                if (lease == null)
+                {
+                    return;
+                }
+
+                GenericPreparedAssetProvider owner = m_Owner
+                    ?? throw new InvalidOperationException(
+                        "Prepared material lease lost its provider ownership.");
+                owner.ReleasePreparedMaterialLease(lease);
+                m_Lease = null;
+                m_Owner = null;
+            }
+        }
+    }
+
+    private sealed class PreparedEnvironment
+    {
+        private readonly GenericPreparedEnvironmentRetirementState m_Retirement;
+
+        public PreparedEnvironment(
+            RHIEnvironmentTextureResource texture,
+            RHIEnvironmentLightingResource lighting,
+            long estimatedGpuBytes)
+        {
+            Texture = texture;
+            Lighting = lighting;
+            EstimatedGpuBytes = estimatedGpuBytes;
+            m_Retirement = new GenericPreparedEnvironmentRetirementState(
+                lighting,
+                texture);
+        }
+
+        public RHIEnvironmentTextureResource Texture { get; }
+        public RHIEnvironmentLightingResource Lighting { get; }
+        public long EstimatedGpuBytes { get; }
+        public bool IsCurrent => m_Retirement.IsCurrent;
+        public bool RetirementComplete => m_Retirement.IsComplete;
+
+        public void TransferRetirementOwnership(Action<IDisposable> transfer) =>
+            m_Retirement.TransferOwnership(transfer);
+    }
 }

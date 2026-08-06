@@ -95,8 +95,10 @@ Shader "GenericRP/StandardLit"
                 float2 UV : TEXCOORD0;
                 float3 Color : COLOR0;
                 float3 WorldNormal : NORMAL0;
+#if USE_NORMAL_MAP
                 float3 WorldTangent : TANGENT0;
                 float TangentSign : TANGENT1;
+#endif
                 float3 WorldPosition : TEXCOORD1;
                 float CameraDepth : TEXCOORD2;
                 nointerpolation float4 ShadowTextureIndices : TEXCOORD3;
@@ -185,8 +187,10 @@ Shader "GenericRP/StandardLit"
                 output.UV = input.UV;
                 output.Color = input.Color;
                 output.WorldNormal = TransformDirection(input.Normal, objectData);
+#if USE_NORMAL_MAP
                 output.WorldTangent = TransformDirection(input.Tangent.xyz, objectData);
                 output.TangentSign = input.Tangent.w;
+#endif
                 output.WorldPosition = TransformPosition(localPosition, objectData);
                 output.CameraDepth = max(output.Position.w, 0.0);
                 output.ShadowTextureIndices = objectData.shadowTextureIndices;

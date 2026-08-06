@@ -23,6 +23,7 @@
       "ArisenEngine.Rendering.IRenderMaterialLibrary",
       "ArisenEngine.Rendering.IRenderPipelineProvider",
       "ArisenEngine.Rendering.IGenericRenderPipelineFeatureRegistry",
+      "ArisenEngine.Rendering.IGenericRenderPipelinePreparedAssetSource",
       "ArisenEngine.Rendering.IGenericRenderPipelineRuntimeShaderRegistry",
       "ArisenEngine.Rendering.Resources.IRHITexture2DResourceCache"
     ],

@@ -63,6 +63,7 @@ internal static class GenericRenderPipelineFeatureDispatcher
         IGenericRenderPipelineFeature[] features,
         in GenericRenderPipelineFeatureSubmissionContext context)
     {
+        var failures = new GenericRenderPipelineSubmissionFailureState();
         for (int i = 0; i < features.Length; i++)
         {
             try
@@ -71,9 +72,15 @@ internal static class GenericRenderPipelineFeatureDispatcher
             }
             catch (Exception ex)
             {
-                throw HookFailure(features[i], nameof(IGenericRenderPipelineFeature.OnFrameSubmitted), ex);
+                failures.Capture(HookFailure(
+                    features[i],
+                    nameof(IGenericRenderPipelineFeature.OnFrameSubmitted),
+                    ex));
             }
         }
+
+        failures.ThrowIfFailed(
+            "One or more Generic RP features failed during frame submission notification.");
     }
 
     public static void ReleaseDeviceResources(IGenericRenderPipelineFeature[] features)
