@@ -44,11 +44,14 @@ public class GenericRenderPipelinePackage : IPackageEntry
             m_MaterialLibrary.TextureResourceCache);
         m_FeatureRegistry = new GenericRenderPipelineFeatureRegistry();
         registry.RegisterService<IGenericRenderPipelineFeatureRegistry>(m_FeatureRegistry);
+        m_ResidencyService = registry.GetService<IRuntimeAssetResidencyService>();
         m_PreparedAssetProvider = new GenericPreparedAssetProvider(
             assetDatabase,
             m_MaterialLibrary,
-            m_DisposalQueue);
-        m_ResidencyService = registry.GetService<IRuntimeAssetResidencyService>();
+            m_DisposalQueue,
+            m_ResidencyService);
+        registry.RegisterService<IGenericRenderPipelinePreparedAssetSource>(
+            m_PreparedAssetProvider);
         m_ResidencyService.RegisterPreparedProvider(m_PreparedAssetProvider);
         m_Provider = new GenericRenderPipelineProvider(
             assetDatabase,

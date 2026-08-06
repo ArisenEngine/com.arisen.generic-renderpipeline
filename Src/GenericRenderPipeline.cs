@@ -486,16 +486,46 @@ public class GenericRenderPipeline : RenderPipeline
     protected override void OnFrameSubmitted(RenderContext context, ulong submittedTicket)
     {
         m_LastSubmittedTicket = submittedTicket;
-        m_PreparedAssetProvider.UpdateSubmittedTicket(submittedTicket);
-        m_DisposalQueue.ReleaseCompleted(
-            context.Device,
-            context.DeviceGeneration);
-        var featureSubmissionContext = new GenericRenderPipelineFeatureSubmissionContext(
-            m_CurrentFeatureFrameContext,
+        var submissionActions = new FrameSubmissionActions(this, context);
+        GenericRenderPipelineFrameSubmission.Execute(
+            ref submissionActions,
             submittedTicket);
-        GenericRenderPipelineFeatureDispatcher.OnFrameSubmitted(
-            m_Features,
-            featureSubmissionContext);
+    }
+
+    private readonly struct FrameSubmissionActions : IGenericRenderPipelineFrameSubmissionActions
+    {
+        private readonly GenericRenderPipeline m_Pipeline;
+        private readonly RenderContext m_Context;
+
+        public FrameSubmissionActions(
+            GenericRenderPipeline pipeline,
+            RenderContext context)
+        {
+            m_Pipeline = pipeline;
+            m_Context = context;
+        }
+
+        public void UpdatePreparedAssetTicket(ulong submittedTicket)
+        {
+            m_Pipeline.m_PreparedAssetProvider.UpdateSubmittedTicket(submittedTicket);
+        }
+
+        public void ReleaseCompletedResources()
+        {
+            m_Pipeline.m_DisposalQueue.ReleaseCompleted(
+                m_Context.Device,
+                m_Context.DeviceGeneration);
+        }
+
+        public void NotifyFeatures(ulong submittedTicket)
+        {
+            var featureSubmissionContext = new GenericRenderPipelineFeatureSubmissionContext(
+                m_Pipeline.m_CurrentFeatureFrameContext,
+                submittedTicket);
+            GenericRenderPipelineFeatureDispatcher.OnFrameSubmitted(
+                m_Pipeline.m_Features,
+                featureSubmissionContext);
+        }
     }
 
     private void OnAssetChanged(AssetChangeEvent change)
@@ -521,7 +551,7 @@ public class GenericRenderPipeline : RenderPipeline
         }
 
         RegisterSceneMaterials(context.StaticMeshItems);
-        m_MaterialLibrary.EnsurePrepared(device, m_LastSubmittedTicket);
+        EnsurePreparedMaterials(device);
 
         if (m_FallbackMesh is { IsValid: true } && m_FallbackMesh.IsSourceStale())
         {
@@ -560,7 +590,6 @@ public class GenericRenderPipeline : RenderPipeline
     private void ApplyAssetInvalidations(ReadOnlySpan<Guid> dirtyGuids)
     {
         m_PreparedAssetProvider.InvalidateByAssetGuids(dirtyGuids);
-        m_MaterialLibrary.InvalidateByAssetGuids(dirtyGuids, m_LastSubmittedTicket);
         m_FailedEnvironmentTextureGuid = Guid.Empty;
         m_FailedEnvironmentTextureStamp = AssetDependencyStamp.Empty;
         m_FailedEnvironmentLightingGuid = Guid.Empty;
@@ -590,6 +619,27 @@ public class GenericRenderPipeline : RenderPipeline
                 ArisenEngine.Core.Diagnostics.Logger.Log($"[GenericRenderPipeline] Asset change invalidated scene mesh {dirtyGuid}; releasing GPU mesh.");
                 m_DisposalQueue.Enqueue(mesh, m_LastSubmittedTicket);
             }
+        }
+    }
+
+    private void EnsurePreparedMaterials(RHIDevice device)
+    {
+        Guid[] staleMaterialGuids = m_MaterialLibrary.EnsurePrepared(
+            device,
+            m_LastSubmittedTicket);
+        if (staleMaterialGuids.Length == 0)
+        {
+            return;
+        }
+
+        ApplyAssetInvalidations(staleMaterialGuids);
+        Guid[] unresolvedStaleGuids = m_MaterialLibrary.EnsurePrepared(
+            device,
+            m_LastSubmittedTicket);
+        if (unresolvedStaleGuids.Length != 0)
+        {
+            throw new InvalidOperationException(
+                "GenericRP material invalidation did not retire every stale current publication.");
         }
     }
 

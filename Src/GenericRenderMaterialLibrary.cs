@@ -15,6 +15,10 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
     private readonly List<MaterialEntry> m_Materials = new();
     private readonly DeferredRenderResourceDisposalQueue m_DisposalQueue;
     private readonly SharedRHITexture2DResourceCache m_TextureCache = new();
+    private readonly Dictionary<RHIMaterialResource, PreparedMaterialOwnership>
+        m_PreparedOwnership = new(ReferenceEqualityComparer.Instance);
+    private ulong m_NextPreparedPublicationGeneration;
+    private int m_PreparedPublicationLeaseCount;
     private bool m_Disposed;
 
     public uint DefaultMaterialID { get; private set; }
@@ -50,6 +54,42 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
     public int PreparedTextureCount => m_TextureCache.ResourceCount;
 
     public long EstimatedTextureGpuBytes => m_TextureCache.EstimatedGpuBytes;
+
+    internal int PreparedPublicationLeaseCount => m_PreparedPublicationLeaseCount;
+
+    internal int RetiredPreparedPublicationCount
+    {
+        get
+        {
+            int count = 0;
+            foreach (PreparedMaterialOwnership ownership in m_PreparedOwnership.Values)
+            {
+                if (!ownership.IsCurrent)
+                {
+                    count++;
+                }
+            }
+
+            return count;
+        }
+    }
+
+    internal long RetiredPreparedPublicationGpuBytes
+    {
+        get
+        {
+            long bytes = 0;
+            foreach (PreparedMaterialOwnership ownership in m_PreparedOwnership.Values)
+            {
+                if (!ownership.IsCurrent)
+                {
+                    bytes = checked(bytes + ownership.EstimatedGpuBytes);
+                }
+            }
+
+            return bytes;
+        }
+    }
 
     public IRHITexture2DResourceCache TextureResourceCache => m_TextureCache;
 
@@ -184,20 +224,23 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
         for (int i = 0; i < m_Materials.Count; i++)
         {
             var entry = m_Materials[i];
-            if (entry.Resource is not { IsValid: true } ||
+            if (entry.Resource == null ||
                 !MaterialDependsOnDirtyGuid(entry, dirtyGuids))
             {
                 continue;
             }
 
             Logger.Log($"[GenericRenderMaterialLibrary] Asset change invalidated material ID {entry.MaterialID}; releasing prepared material.");
-            m_DisposalQueue.Enqueue(entry.Resource, submittedTicket);
+            RetirePreparedResource(
+                entry.Resource,
+                submittedTicket,
+                disposeImmediately: false);
             entry.Resource = null;
             m_Materials[i] = entry;
         }
     }
 
-    public void EnsurePrepared(RHIDevice device, ulong submittedTicket)
+    public Guid[] EnsurePrepared(RHIDevice device, ulong submittedTicket)
     {
         ThrowIfDisposed();
 
@@ -206,13 +249,20 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
             throw new ArgumentException("[GenericRenderMaterialLibrary] Cannot prepare materials with an invalid RHI device.", nameof(device));
         }
 
+        List<Guid>? staleGuids = null;
         for (int i = 0; i < m_Materials.Count; i++)
         {
-            EnsurePreparedAtIndex(device, submittedTicket, i);
+            Guid staleGuid = EnsurePreparedAtIndex(device, submittedTicket, i);
+            if (staleGuid != Guid.Empty)
+            {
+                (staleGuids ??= new List<Guid>()).Add(staleGuid);
+            }
         }
+
+        return staleGuids?.ToArray() ?? Array.Empty<Guid>();
     }
 
-    public void EnsurePrepared(RHIDevice device, uint materialId, ulong submittedTicket)
+    public Guid EnsurePrepared(RHIDevice device, uint materialId, ulong submittedTicket)
     {
         ThrowIfDisposed();
         if (!device.IsValid)
@@ -223,7 +273,7 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
         }
 
         int index = GetMaterialIndex(materialId);
-        EnsurePreparedAtIndex(device, submittedTicket, index);
+        return EnsurePreparedAtIndex(device, submittedTicket, index);
     }
 
     public bool TryGetPreparedMaterial(Guid materialGuid, out RHIMaterialResource resource)
@@ -243,8 +293,54 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
         return false;
     }
 
-    public bool ReleasePrepared(
+    public Guid[] GetStalePreparedMaterialGuids()
+    {
+        ThrowIfDisposed();
+        List<Guid>? staleGuids = null;
+        for (int index = 0; index < m_Materials.Count; index++)
+        {
+            MaterialEntry entry = m_Materials[index];
+            if (entry.Resource is { } resource &&
+                (!resource.IsValid || resource.IsSourceStale()))
+            {
+                (staleGuids ??= new List<Guid>()).Add(entry.MaterialGuid);
+            }
+        }
+
+        return staleGuids?.ToArray() ?? Array.Empty<Guid>();
+    }
+
+    internal bool TryAcquirePreparedMaterial(
         Guid materialGuid,
+        out PreparedMaterialLease lease)
+    {
+        ThrowIfDisposed();
+        if (m_MaterialIDs.TryGetValue(materialGuid, out uint materialId))
+        {
+            int index = GetMaterialIndex(materialId);
+            if (m_Materials[index].Resource is { IsValid: true } prepared &&
+                !prepared.IsSourceStale() &&
+                m_PreparedOwnership.TryGetValue(
+                    prepared,
+                    out PreparedMaterialOwnership? ownership) &&
+                ownership.IsCurrent)
+            {
+                ownership.LeaseCount = checked(ownership.LeaseCount + 1);
+                m_PreparedPublicationLeaseCount = checked(
+                    m_PreparedPublicationLeaseCount + 1);
+                lease = new PreparedMaterialLease(this, ownership);
+                return true;
+            }
+        }
+
+        lease = null!;
+        return false;
+    }
+
+    internal bool ReleasePrepared(
+        Guid materialGuid,
+        RHIMaterialResource expectedResource,
+        ulong expectedPublicationGeneration,
         ulong submittedTicket,
         bool disposeImmediately = false)
     {
@@ -257,18 +353,44 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
 
         int index = GetMaterialIndex(materialId);
         MaterialEntry entry = m_Materials[index];
-        if (entry.Resource == null) return false;
-        if (disposeImmediately)
+        if (!ReferenceEquals(entry.Resource, expectedResource) ||
+            !m_PreparedOwnership.TryGetValue(
+                expectedResource,
+                out PreparedMaterialOwnership? ownership) ||
+            !ownership.IsCurrent ||
+            ownership.PublicationGeneration != expectedPublicationGeneration)
         {
-            entry.Resource.Dispose();
+            return false;
         }
-        else
-        {
-            m_DisposalQueue.Enqueue(entry.Resource, submittedTicket);
-        }
+
+        RetirePreparedResource(entry.Resource, submittedTicket, disposeImmediately);
         entry.Resource = null;
         m_Materials[index] = entry;
         return true;
+    }
+
+    internal void SetPreparedPublicationEstimatedGpuBytes(
+        RHIMaterialResource resource,
+        ulong publicationGeneration,
+        long estimatedGpuBytes)
+    {
+        if (estimatedGpuBytes < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(estimatedGpuBytes));
+        }
+        if (!m_PreparedOwnership.TryGetValue(
+                resource,
+                out PreparedMaterialOwnership? ownership) ||
+            !ownership.IsCurrent ||
+            ownership.PublicationGeneration != publicationGeneration)
+        {
+            throw new InvalidOperationException(
+                "[GenericRenderMaterialLibrary] Cannot account an inactive prepared material publication.");
+        }
+
+        ownership.EstimatedGpuBytes = Math.Max(
+            ownership.EstimatedGpuBytes,
+            estimatedGpuBytes);
     }
 
     public void ApplyMaterialSlots(StaticMeshPass pass)
@@ -292,12 +414,32 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
 
     public void ReleasePreparedResources()
     {
+        if (m_PreparedPublicationLeaseCount != 0)
+        {
+            throw new InvalidOperationException(
+                $"[GenericRenderMaterialLibrary] Cannot release prepared materials while " +
+                $"{m_PreparedPublicationLeaseCount} exact-publication leases remain active.");
+        }
+
         for (int i = m_Materials.Count - 1; i >= 0; i--)
         {
             var entry = m_Materials[i];
-            entry.Resource?.Dispose();
+            if (entry.Resource != null)
+            {
+                RetirePreparedResource(
+                    entry.Resource,
+                    submittedTicket: 0,
+                    disposeImmediately: true);
+            }
             entry.Resource = null;
             m_Materials[i] = entry;
+        }
+
+        if (m_PreparedOwnership.Count != 0)
+        {
+            throw new InvalidOperationException(
+                $"[GenericRenderMaterialLibrary] {m_PreparedOwnership.Count} prepared " +
+                "material publications retained ownership after device-resource release.");
         }
     }
 
@@ -388,37 +530,166 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
         return index;
     }
 
-    private void EnsurePreparedAtIndex(
+    private Guid EnsurePreparedAtIndex(
         RHIDevice device,
         ulong submittedTicket,
         int index)
     {
         var entry = m_Materials[index];
-        if (entry.Resource is { IsValid: true } && !entry.Resource.IsSourceStale())
+        if (entry.Resource is { } current)
         {
-            return;
-        }
-
-        if (entry.Resource != null)
-        {
-            Logger.Log(
-                $"[GenericRenderMaterialLibrary] Material dependency changed; reloading material ID {entry.MaterialID}.");
-            m_DisposalQueue.Enqueue(entry.Resource, submittedTicket);
-            entry.Resource = null;
+            return current.IsValid && !current.IsSourceStale()
+                ? Guid.Empty
+                : entry.MaterialGuid;
         }
 
         var cookedMaterial = MaterialAssetCooker.LoadOrCook(m_AssetDatabase, entry.MaterialGuid);
-        entry.Resource = new RHIMaterialResource(
+        var resource = new RHIMaterialResource(
             device,
             m_AssetDatabase,
             cookedMaterial.Asset,
             cookedMaterial.Handle,
             m_TextureCache);
-        m_Materials[index] = entry;
+        bool ownershipPublished = false;
+        try
+        {
+            m_PreparedOwnership.Add(
+                resource,
+                new PreparedMaterialOwnership(
+                    resource,
+                    NextPreparedPublicationGeneration()));
+            ownershipPublished = true;
+            entry.Resource = resource;
+            m_Materials[index] = entry;
+        }
+        catch
+        {
+            if (ownershipPublished)
+            {
+                RetirePreparedResource(
+                    resource,
+                    submittedTicket: 0,
+                    disposeImmediately: true);
+            }
+            else
+            {
+                resource.Dispose();
+            }
+            throw;
+        }
 
         Logger.Log(
             $"[GenericRenderMaterialLibrary] Prepared material | ID: {entry.MaterialID} | " +
             $"Name: {cookedMaterial.Asset.Name} | Shader: {cookedMaterial.Asset.Shader.Name}");
+        return Guid.Empty;
+    }
+
+    private ulong NextPreparedPublicationGeneration()
+    {
+        m_NextPreparedPublicationGeneration = checked(
+            m_NextPreparedPublicationGeneration + 1);
+        return m_NextPreparedPublicationGeneration;
+    }
+
+    private void RetirePreparedResource(
+        RHIMaterialResource resource,
+        ulong submittedTicket,
+        bool disposeImmediately)
+    {
+        if (!m_PreparedOwnership.TryGetValue(
+                resource,
+                out PreparedMaterialOwnership? ownership) ||
+            !ownership.IsCurrent)
+        {
+            throw new InvalidOperationException(
+                "[GenericRenderMaterialLibrary] Prepared material publication ownership is missing or already retired.");
+        }
+
+        if (ownership.LeaseCount != 0 && disposeImmediately)
+        {
+            throw new InvalidOperationException(
+                $"[GenericRenderMaterialLibrary] Cannot immediately release material " +
+                $"publication {ownership.PublicationGeneration} while " +
+                $"{ownership.LeaseCount} leases remain active.");
+        }
+
+        ownership.IsCurrent = false;
+        if (ownership.LeaseCount == 0)
+        {
+            try
+            {
+                DisposePreparedResource(resource, submittedTicket, disposeImmediately);
+            }
+            catch
+            {
+                ownership.IsCurrent = true;
+                throw;
+            }
+
+            if (!m_PreparedOwnership.Remove(resource))
+            {
+                throw new InvalidOperationException(
+                    "[GenericRenderMaterialLibrary] Retired prepared material publication was not tracked.");
+            }
+            return;
+        }
+
+        ownership.RetirementTicket = Math.Max(
+            ownership.RetirementTicket,
+            submittedTicket);
+    }
+
+    private void ReleasePreparedLease(PreparedMaterialOwnership ownership)
+    {
+        if (!m_PreparedOwnership.TryGetValue(
+                ownership.Resource,
+                out PreparedMaterialOwnership? current) ||
+            !ReferenceEquals(current, ownership) ||
+            ownership.LeaseCount <= 0 ||
+            m_PreparedPublicationLeaseCount <= 0)
+        {
+            throw new InvalidOperationException(
+                "[GenericRenderMaterialLibrary] Prepared material lease ownership is invalid.");
+        }
+
+        if (ownership.LeaseCount == 1 && !ownership.IsCurrent)
+        {
+            DisposePreparedResource(
+                ownership.Resource,
+                ownership.RetirementTicket,
+                disposeImmediately: false);
+            if (!m_PreparedOwnership.Remove(ownership.Resource))
+            {
+                throw new InvalidOperationException(
+                    "[GenericRenderMaterialLibrary] Retired material publication was not tracked during lease release.");
+            }
+        }
+
+        ownership.LeaseCount--;
+        m_PreparedPublicationLeaseCount--;
+    }
+
+    private bool IsPreparedPublicationCurrent(PreparedMaterialOwnership ownership) =>
+        !m_Disposed &&
+        ownership.IsCurrent &&
+        m_PreparedOwnership.TryGetValue(
+            ownership.Resource,
+            out PreparedMaterialOwnership? current) &&
+        ReferenceEquals(current, ownership);
+
+    private void DisposePreparedResource(
+        RHIMaterialResource resource,
+        ulong submittedTicket,
+        bool disposeImmediately)
+    {
+        if (disposeImmediately)
+        {
+            resource.Dispose();
+        }
+        else
+        {
+            m_DisposalQueue.Enqueue(resource, submittedTicket);
+        }
     }
 
     private struct MaterialEntry
@@ -432,6 +703,59 @@ public sealed class GenericRenderMaterialLibrary : IRenderMaterialLibrary, IDisp
             MaterialGuid = materialGuid;
             MaterialID = materialId;
             Resource = null;
+        }
+    }
+
+    internal sealed class PreparedMaterialOwnership
+    {
+        public PreparedMaterialOwnership(
+            RHIMaterialResource resource,
+            ulong publicationGeneration)
+        {
+            Resource = resource;
+            PublicationGeneration = publicationGeneration;
+        }
+
+        public RHIMaterialResource Resource { get; }
+        public ulong PublicationGeneration { get; }
+        public int LeaseCount { get; set; }
+        public bool IsCurrent { get; set; } = true;
+        public ulong RetirementTicket { get; set; }
+        public long EstimatedGpuBytes { get; set; }
+    }
+
+    internal sealed class PreparedMaterialLease : IDisposable
+    {
+        private readonly object m_DisposeGate = new();
+        private GenericRenderMaterialLibrary? m_Owner;
+        private readonly PreparedMaterialOwnership m_Ownership;
+
+        internal PreparedMaterialLease(
+            GenericRenderMaterialLibrary owner,
+            PreparedMaterialOwnership ownership)
+        {
+            m_Owner = owner;
+            m_Ownership = ownership;
+        }
+
+        public RHIMaterialResource Resource => m_Ownership.Resource;
+        public ulong PublicationGeneration => m_Ownership.PublicationGeneration;
+        public bool IsCurrent =>
+            Volatile.Read(ref m_Owner)?.IsPreparedPublicationCurrent(m_Ownership) == true;
+
+        public void Dispose()
+        {
+            lock (m_DisposeGate)
+            {
+                GenericRenderMaterialLibrary? owner = m_Owner;
+                if (owner == null)
+                {
+                    return;
+                }
+
+                owner.ReleasePreparedLease(m_Ownership);
+                m_Owner = null;
+            }
         }
     }
 }
