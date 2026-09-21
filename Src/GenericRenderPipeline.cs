@@ -200,6 +200,7 @@ public class GenericRenderPipeline : RenderPipeline
         m_CurrentFeatureFrameContext = new GenericRenderPipelineFeatureFrameContext(
             context,
             viewProjection,
+            GetViewRelativeViewProjection(context),
             cameraPosition,
             directionalLight,
             sceneEnvironment,
@@ -1438,6 +1439,18 @@ public class GenericRenderPipeline : RenderPipeline
         var cameras = context.Cameras;
         ref readonly var camera = ref cameras[0];
         return camera.ViewMatrix * camera.ProjectionMatrix;
+    }
+
+    private static Matrix4x4 GetViewRelativeViewProjection(RenderContext context)
+    {
+        if (context.CameraCount <= 0)
+        {
+            return Matrix4x4.Identity;
+        }
+
+        var cameras = context.Cameras;
+        ref readonly var camera = ref cameras[0];
+        return camera.ViewRelativeViewMatrix * camera.ProjectionMatrix;
     }
 
     private static Matrix4x4 GetViewMatrix(RenderContext context)

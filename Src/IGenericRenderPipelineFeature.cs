@@ -14,6 +14,7 @@ public readonly struct GenericRenderPipelineFeatureFrameContext
     internal GenericRenderPipelineFeatureFrameContext(
         RenderContext renderContext,
         Matrix4x4 viewProjection,
+        Matrix4x4 viewRelativeViewProjection,
         Vector3 cameraPosition,
         DirectionalLight directionalLight,
         SceneEnvironment sceneEnvironment,
@@ -22,6 +23,7 @@ public readonly struct GenericRenderPipelineFeatureFrameContext
     {
         RenderContext = renderContext;
         ViewProjection = viewProjection;
+        ViewRelativeViewProjection = viewRelativeViewProjection;
         CameraPosition = cameraPosition;
         DirectionalLight = directionalLight;
         SceneEnvironment = sceneEnvironment;
@@ -32,6 +34,12 @@ public readonly struct GenericRenderPipelineFeatureFrameContext
     public RenderContext RenderContext { get; }
     public RenderFrameSnapshot Snapshot => RenderContext.Snapshot;
     public Matrix4x4 ViewProjection { get; }
+    /// <summary>
+    /// View-projection for vertex positions expressed relative to the render camera (the view
+    /// frame). It is pure rotation plus projection, so no world-origin rebase can change it.
+    /// Features that render view-frame geometry must pair it with view-frame positions.
+    /// </summary>
+    public Matrix4x4 ViewRelativeViewProjection { get; }
     public Vector3 CameraPosition { get; }
     public DirectionalLight DirectionalLight { get; }
     public SceneEnvironment SceneEnvironment { get; }

@@ -256,9 +256,10 @@ internal static class DirectionalShadowFitter
             ? Math.Clamp(settings.TerminalFadeFraction, 0.0f, 0.5f)
             : GenericShadowSettings.Default.TerminalFadeFraction;
 
-        Camera fittingCamera = camera;
-        fittingCamera.Position = Vector3.Zero;
-        Matrix4x4 viewProjection = fittingCamera.ViewMatrix * fittingCamera.ProjectionMatrix;
+        // Cascades are fitted around a camera sitting at the origin of its own frame, so the
+        // shadow frame is the view frame and never depends on the rebaseable world origin.
+        Matrix4x4 viewProjection =
+            camera.ViewRelativeViewMatrix * camera.ProjectionMatrix;
         if (!Matrix4x4.Invert(viewProjection, out Matrix4x4 inverseViewProjection))
         {
             throw new InvalidOperationException(

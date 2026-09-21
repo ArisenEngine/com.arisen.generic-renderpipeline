@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using Arisen.Native.RHI;
 using ArisenEngine.Core.Diagnostics;
+using ArisenEngine.Core.Math;
 using ArisenEngine.Core.RHI;
 using ArisenEngine.Rendering.Resources;
 
@@ -289,15 +290,17 @@ internal readonly struct EnvironmentGpuConstants
             camera.Rotation.Y * (MathF.PI / 180.0f),
             camera.Rotation.X * (MathF.PI / 180.0f),
             camera.Rotation.Z * (MathF.PI / 180.0f));
-        Vector3 right = NormalizeOrFallback(
-            Vector3.Transform(Vector3.UnitX, rotation),
-            Vector3.UnitX);
         Vector3 up = NormalizeOrFallback(
             Vector3.Transform(Vector3.UnitY, rotation),
             Vector3.UnitY);
         Vector3 forward = NormalizeOrFallback(
             Vector3.Transform(Vector3.UnitZ, rotation),
             Vector3.UnitZ);
+        // The sky and atmosphere shaders rebuild their view ray as forward + right * x + up * y, so
+        // `right` has to be the image's right axis of the view matrix (MathExtensions.RightVector),
+        // not the world +X axis. Feeding world +X here drew the sky and the sun mirrored against the
+        // geometry that the same camera renders.
+        Vector3 right = NormalizeOrFallback(rotation.RightVector(), Vector3.UnitX);
         Vector3 sunDirection = NormalizeOrFallback(
             directionalLight.Direction,
             DirectionalLight.Default.Direction);
