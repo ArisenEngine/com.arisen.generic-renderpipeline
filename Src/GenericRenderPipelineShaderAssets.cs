@@ -57,6 +57,9 @@ internal static class GenericRenderPipelineShaderAssets
         return
         [
             CreateDirectionalShadow(),
+            // The shadow pass casts skinned meshes too, so the depth-only shader's SKINNED variant is
+            // a runtime asset in its own right: a cooked-only profile needs it beside the static one.
+            MeshSkinningShaderVariant.Create(CreateDirectionalShadow()),
             CreateEnvironmentSky(),
             CreateOutdoorAtmosphere(),
             CreateTonemap()

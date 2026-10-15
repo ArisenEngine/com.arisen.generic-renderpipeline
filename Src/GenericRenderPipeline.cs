@@ -47,8 +47,12 @@ public class GenericRenderPipeline : RenderPipeline
     private readonly GenericSkinPaletteBuffer m_SkinPaletteBuffer = new();
     private Matrix4x4[] m_SkinPaletteMatrices = Array.Empty<Matrix4x4>();
     private Matrix4x4[] m_SkinPaletteJointGlobals = Array.Empty<Matrix4x4>();
+    // Per static item, the palette block the frame allocated for it. The shadow pass casts from a
+    // cascade's frustum rather than the camera's, so it reads the block by item instead of relying on
+    // the camera pass having kept the item.
+    private int[] m_SceneItemSkinPaletteOffsets = Array.Empty<int>();
+    private int[] m_SceneItemSkinJointCounts = Array.Empty<int>();
     private int m_SkinPaletteMatrixCount;
-    private int m_SkippedSkinnedShadowItemCount;
     private int m_SceneDrawCommandCount;
     private int m_DepthWritingDrawCommandCount;
     private int m_TransparentDrawCommandCount;
@@ -234,16 +238,22 @@ public class GenericRenderPipeline : RenderPipeline
             m_ShadowDrawRanges,
             m_DirectionalShadowFrameData);
         m_DirectionalShadowPass.SetPreparedDraws(preparedShadowDraws);
-        m_DirectionalShadowPass.Prepare(context);
 
         m_SkinPaletteBuffer.Prepare(
             context,
             context.Device.GetFactory(),
             new ReadOnlySpan<Matrix4x4>(m_SkinPaletteMatrices, 0, m_SkinPaletteMatrixCount));
+        // Both passes draw from the frame's palette, so the shadow pass is prepared after the block
+        // the frame allocated for its skinned casters has been uploaded.
+        m_DirectionalShadowPass.SetPreparedSkinning(
+            m_SkinPaletteBuffer.Buffer,
+            m_SkinPaletteBuffer.BindlessIndex,
+            m_SkinPaletteBuffer.HasData);
         m_StaticMeshPass.SetPreparedSkinning(
             m_SkinPaletteBuffer.Buffer,
             m_SkinPaletteBuffer.BindlessIndex,
             m_SkinPaletteBuffer.HasData);
+        m_DirectionalShadowPass.Prepare(context);
         m_StaticMeshPass.SetStaticMeshResources(fallbackMaterial, m_FallbackMesh!);
         ConfigureStaticMeshPass(
             m_StaticMeshPass,
@@ -911,7 +921,6 @@ public class GenericRenderPipeline : RenderPipeline
     {
         m_ShadowDrawCommandCount = 0;
         m_DroppedShadowDrawCommandCount = 0;
-        m_SkippedSkinnedShadowItemCount = 0;
         Span<DirectionalShadowCascadeDrawRange> ranges =
             stackalloc DirectionalShadowCascadeDrawRange[4];
         int cascadeCount = cascades.Count;
@@ -925,12 +934,6 @@ public class GenericRenderPipeline : RenderPipeline
             int requestedCasterCount = 0;
             for (int i = 0; i < cameraVisibleDraws.Length; i++)
             {
-                if (cameraVisibleDraws[i].IsSkinned)
-                {
-                    m_SkippedSkinnedShadowItemCount++;
-                    continue;
-                }
-
                 requestedCasterCount++;
             }
 
@@ -942,13 +945,7 @@ public class GenericRenderPipeline : RenderPipeline
                 int written = 0;
                 for (int i = 0; i < cameraVisibleDraws.Length && written < accepted; i++)
                 {
-                    ref readonly MeshDrawCommand draw = ref cameraVisibleDraws[i];
-                    if (draw.IsSkinned)
-                    {
-                        continue;
-                    }
-
-                    m_ShadowDrawCommands[rangeStart + written] = draw;
+                    m_ShadowDrawCommands[rangeStart + written] = cameraVisibleDraws[i];
                     written++;
                 }
 
@@ -991,15 +988,6 @@ public class GenericRenderPipeline : RenderPipeline
                     continue;
                 }
 
-                if (mesh.IsSkinned)
-                {
-                    // Skinned shadow casters are the next slice of C1: drawing stride-80 vertices
-                    // through the static depth pipeline would render garbage, so the caster is
-                    // skipped and counted instead of corrupted.
-                    m_SkippedSkinnedShadowItemCount++;
-                    continue;
-                }
-
                 if (StaticMeshFrustumCuller.TryGetWorldBounds(
                         item,
                         mesh.Bounds,
@@ -1018,6 +1006,7 @@ public class GenericRenderPipeline : RenderPipeline
                 int firstAppendedDraw = m_ShadowDrawCommandCount;
                 int appendedDrawEnd = AppendShadowItemDrawCommands(
                     item,
+                    itemIndex,
                     mesh,
                     out int droppedDrawCount);
                 m_DroppedShadowDrawCommandCount += droppedDrawCount;
@@ -1054,6 +1043,7 @@ public class GenericRenderPipeline : RenderPipeline
         m_SceneDrawCommandCount = 0;
         m_SkinPaletteMatrixCount = 0;
         m_ShadowReceiverBounds = default;
+        EnsureSceneItemSkinCapacity(items.Length);
         int visibleItemCount = 0;
         int culledItemCount = 0;
         if (items.IsEmpty)
@@ -1077,6 +1067,21 @@ public class GenericRenderPipeline : RenderPipeline
                 continue;
             }
 
+            // Every valid skinned item gets its palette block here, including the ones the camera
+            // frustum culls: a caster is drawn from a cascade's frustum instead, and it still has to
+            // deform by its pose, so the block cannot depend on the camera's culling decision.
+            uint skinPaletteOffset = 0;
+            uint skinJointCount = 0;
+            if (mesh.IsSkinned)
+            {
+                skinPaletteOffset = checked((uint)m_SkinPaletteMatrixCount);
+                skinJointCount = checked((uint)mesh.SkinJointCount);
+                AppendSkinPaletteBlock(mesh, item, skinJointRotations);
+            }
+
+            m_SceneItemSkinPaletteOffsets[i] = checked((int)skinPaletteOffset);
+            m_SceneItemSkinJointCounts[i] = checked((int)skinJointCount);
+
             bool hasWorldBounds = StaticMeshFrustumCuller.TryGetWorldBounds(
                 item,
                 mesh.Bounds,
@@ -1093,15 +1098,6 @@ public class GenericRenderPipeline : RenderPipeline
             if (hasWorldBounds)
             {
                 m_ShadowReceiverBounds.Add(worldBounds);
-            }
-
-            uint skinPaletteOffset = 0;
-            uint skinJointCount = 0;
-            if (mesh.IsSkinned)
-            {
-                skinPaletteOffset = checked((uint)m_SkinPaletteMatrixCount);
-                skinJointCount = checked((uint)mesh.SkinJointCount);
-                AppendSkinPaletteBlock(mesh, item, skinJointRotations);
             }
 
             m_SceneDrawCommandCount = AppendItemDrawCommands(
@@ -1214,6 +1210,7 @@ public class GenericRenderPipeline : RenderPipeline
 
     private int AppendShadowItemDrawCommands(
         in StaticMeshRenderItem item,
+        int itemIndex,
         RHIStaticMeshResource mesh,
         out int droppedDrawCount)
     {
@@ -1251,19 +1248,27 @@ public class GenericRenderPipeline : RenderPipeline
             m_ShadowDrawCommandCount,
             acceptedSubmeshes);
         uint materialId = ResolveMaterialId(item.MaterialGuid);
+        // The frame allocated this skinned item's palette block while it prepared the camera's
+        // draws, so a caster casts with the same pose the lit draw deforms by.
+        uint skinPaletteOffset = checked((uint)Math.Max(0, m_SceneItemSkinPaletteOffsets[itemIndex]));
+        uint skinJointCount = checked((uint)Math.Max(0, m_SceneItemSkinJointCounts[itemIndex]));
         int written = item.MaterialGuid == Guid.Empty
             ? mesh.CreateDrawCommands(
                 destination,
                 item.LocalToWorld,
                 materialId,
                 firstSubmeshIndex,
-                acceptedSubmeshes)
+                acceptedSubmeshes,
+                skinPaletteOffset,
+                skinJointCount)
             : mesh.CreateDrawCommandsWithMaterialOverride(
                 destination,
                 item.LocalToWorld,
                 materialId,
                 firstSubmeshIndex,
-                acceptedSubmeshes);
+                acceptedSubmeshes,
+                skinPaletteOffset,
+                skinJointCount);
         return m_ShadowDrawCommandCount + written;
     }
 
@@ -1431,6 +1436,16 @@ public class GenericRenderPipeline : RenderPipeline
         if (drawCommands.Length < capacity)
         {
             Array.Resize(ref drawCommands, Math.Max(capacity, drawCommands.Length * 2));
+        }
+    }
+
+    private void EnsureSceneItemSkinCapacity(int itemCount)
+    {
+        if (m_SceneItemSkinPaletteOffsets.Length < itemCount)
+        {
+            int capacity = Math.Max(itemCount, m_SceneItemSkinPaletteOffsets.Length * 2);
+            Array.Resize(ref m_SceneItemSkinPaletteOffsets, capacity);
+            Array.Resize(ref m_SceneItemSkinJointCounts, capacity);
         }
     }
 
