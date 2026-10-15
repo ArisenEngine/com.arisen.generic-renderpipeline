@@ -44,6 +44,11 @@ public class GenericRenderPipeline : RenderPipeline
     private MeshDrawCommand[] m_TransparentDrawCommands = Array.Empty<MeshDrawCommand>();
     private TransparentDrawSortKey[] m_TransparentDrawSortKeys = Array.Empty<TransparentDrawSortKey>();
     private MeshDrawCommand[] m_ShadowDrawCommands = Array.Empty<MeshDrawCommand>();
+    private readonly GenericSkinPaletteBuffer m_SkinPaletteBuffer = new();
+    private Matrix4x4[] m_SkinPaletteMatrices = Array.Empty<Matrix4x4>();
+    private Matrix4x4[] m_SkinPaletteJointGlobals = Array.Empty<Matrix4x4>();
+    private int m_SkinPaletteMatrixCount;
+    private int m_SkippedSkinnedShadowItemCount;
     private int m_SceneDrawCommandCount;
     private int m_DepthWritingDrawCommandCount;
     private int m_TransparentDrawCommandCount;
@@ -231,6 +236,14 @@ public class GenericRenderPipeline : RenderPipeline
         m_DirectionalShadowPass.SetPreparedDraws(preparedShadowDraws);
         m_DirectionalShadowPass.Prepare(context);
 
+        m_SkinPaletteBuffer.Prepare(
+            context,
+            context.Device.GetFactory(),
+            new ReadOnlySpan<Matrix4x4>(m_SkinPaletteMatrices, 0, m_SkinPaletteMatrixCount));
+        m_StaticMeshPass.SetPreparedSkinning(
+            m_SkinPaletteBuffer.Buffer,
+            m_SkinPaletteBuffer.BindlessIndex,
+            m_SkinPaletteBuffer.HasData);
         m_StaticMeshPass.SetStaticMeshResources(fallbackMaterial, m_FallbackMesh!);
         ConfigureStaticMeshPass(
             m_StaticMeshPass,
@@ -466,6 +479,7 @@ public class GenericRenderPipeline : RenderPipeline
             throw new InvalidOperationException(
                 $"GenericRP has {m_DisposalQueue.PendingCount} deferred resources without a bound RHI device.");
         }
+        m_SkinPaletteBuffer.Dispose();
         m_DirectionalShadowPass.Dispose();
         m_DirectionalShadowFrameBuffer.Dispose();
         m_EnvironmentFrameBuffer.Dispose();
@@ -576,6 +590,7 @@ public class GenericRenderPipeline : RenderPipeline
         PrepareSceneDrawCommands(
             device,
             context.StaticMeshItems,
+            context.SkinJointRotations,
             GetViewProjection(context),
             context.CameraCount > 0);
     }
@@ -896,6 +911,7 @@ public class GenericRenderPipeline : RenderPipeline
     {
         m_ShadowDrawCommandCount = 0;
         m_DroppedShadowDrawCommandCount = 0;
+        m_SkippedSkinnedShadowItemCount = 0;
         Span<DirectionalShadowCascadeDrawRange> ranges =
             stackalloc DirectionalShadowCascadeDrawRange[4];
         int cascadeCount = cascades.Count;
@@ -906,18 +922,41 @@ public class GenericRenderPipeline : RenderPipeline
                 Math.Min(
                     MaximumDirectionalShadowDrawCommands,
                     checked(cameraVisibleDraws.Length * cascadeCount)));
+            int requestedCasterCount = 0;
+            for (int i = 0; i < cameraVisibleDraws.Length; i++)
+            {
+                if (cameraVisibleDraws[i].IsSkinned)
+                {
+                    m_SkippedSkinnedShadowItemCount++;
+                    continue;
+                }
+
+                requestedCasterCount++;
+            }
+
             for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
             {
                 int rangeStart = m_ShadowDrawCommandCount;
                 int remaining = MaximumDirectionalShadowDrawCommands - rangeStart;
-                int accepted = Math.Min(cameraVisibleDraws.Length, Math.Max(0, remaining));
-                cameraVisibleDraws.Slice(0, accepted).CopyTo(
-                    m_ShadowDrawCommands.AsSpan(rangeStart, accepted));
-                m_ShadowDrawCommandCount += accepted;
-                m_DroppedShadowDrawCommandCount += cameraVisibleDraws.Length - accepted;
+                int accepted = Math.Min(requestedCasterCount, Math.Max(0, remaining));
+                int written = 0;
+                for (int i = 0; i < cameraVisibleDraws.Length && written < accepted; i++)
+                {
+                    ref readonly MeshDrawCommand draw = ref cameraVisibleDraws[i];
+                    if (draw.IsSkinned)
+                    {
+                        continue;
+                    }
+
+                    m_ShadowDrawCommands[rangeStart + written] = draw;
+                    written++;
+                }
+
+                m_ShadowDrawCommandCount += written;
+                m_DroppedShadowDrawCommandCount += requestedCasterCount - accepted;
                 ranges[cascadeIndex] = new DirectionalShadowCascadeDrawRange(
                     rangeStart,
-                    accepted);
+                    written);
             }
 
             m_ShadowCasterCullingStats = new StaticMeshCullingStats(
@@ -949,6 +988,15 @@ public class GenericRenderPipeline : RenderPipeline
                 RHIStaticMeshResource mesh = GetOrCreateSceneMesh(device, item.MeshGuid);
                 if (mesh is not { IsValid: true })
                 {
+                    continue;
+                }
+
+                if (mesh.IsSkinned)
+                {
+                    // Skinned shadow casters are the next slice of C1: drawing stride-80 vertices
+                    // through the static depth pipeline would render garbage, so the caster is
+                    // skipped and counted instead of corrupted.
+                    m_SkippedSkinnedShadowItemCount++;
                     continue;
                 }
 
@@ -999,10 +1047,12 @@ public class GenericRenderPipeline : RenderPipeline
     private void PrepareSceneDrawCommands(
         RHIDevice device,
         ReadOnlySpan<StaticMeshRenderItem> items,
+        ReadOnlySpan<Quaternion> skinJointRotations,
         Matrix4x4 viewProjection,
         bool enableFrustumCulling)
     {
         m_SceneDrawCommandCount = 0;
+        m_SkinPaletteMatrixCount = 0;
         m_ShadowReceiverBounds = default;
         int visibleItemCount = 0;
         int culledItemCount = 0;
@@ -1045,11 +1095,22 @@ public class GenericRenderPipeline : RenderPipeline
                 m_ShadowReceiverBounds.Add(worldBounds);
             }
 
+            uint skinPaletteOffset = 0;
+            uint skinJointCount = 0;
+            if (mesh.IsSkinned)
+            {
+                skinPaletteOffset = checked((uint)m_SkinPaletteMatrixCount);
+                skinJointCount = checked((uint)mesh.SkinJointCount);
+                AppendSkinPaletteBlock(mesh, item, skinJointRotations);
+            }
+
             m_SceneDrawCommandCount = AppendItemDrawCommands(
                 ref m_SceneDrawCommands,
                 m_SceneDrawCommandCount,
                 item,
-                mesh);
+                mesh,
+                skinPaletteOffset,
+                skinJointCount);
         }
 
         m_StaticMeshCullingStats = new StaticMeshCullingStats(
@@ -1057,6 +1118,66 @@ public class GenericRenderPipeline : RenderPipeline
             visibleItemCount,
             culledItemCount);
         PlotStaticMeshCullingDiagnostics();
+    }
+
+    /// <summary>
+    /// Appends one item's palette block. The palette is rebuilt every frame because a pose can
+    /// change every frame, and the block layout is dense with the joint count the cooked skin
+    /// declares.
+    /// </summary>
+    private void AppendSkinPaletteBlock(
+        RHIStaticMeshResource mesh,
+        in StaticMeshRenderItem item,
+        ReadOnlySpan<Quaternion> skinJointRotations)
+    {
+        MeshSkin? skin = mesh.Skin;
+        if (skin == null)
+        {
+            return;
+        }
+
+        int jointCount = skin.Joints.Count;
+        int requiredMatrixCapacity = m_SkinPaletteMatrixCount + jointCount;
+        if (m_SkinPaletteMatrices.Length < requiredMatrixCapacity)
+        {
+            Array.Resize(ref m_SkinPaletteMatrices, Math.Max(requiredMatrixCapacity, m_SkinPaletteMatrices.Length * 2));
+        }
+
+        if (m_SkinPaletteJointGlobals.Length < jointCount)
+        {
+            Array.Resize(ref m_SkinPaletteJointGlobals, jointCount);
+        }
+
+        ReadOnlySpan<Quaternion> poseRotations = ReadOnlySpan<Quaternion>.Empty;
+        if (item.SkinJointCount > 0)
+        {
+            if (item.SkinJointCount != jointCount)
+            {
+                throw new InvalidOperationException(
+                    $"[GenericRenderPipeline] Mesh '{item.MeshGuid:D}' cooks {jointCount} joints, but the entity posed " +
+                    $"{item.SkinJointCount}. A pose must address the cooked skeleton.");
+            }
+
+            if (item.SkinJointOffset < 0 || item.SkinJointOffset + item.SkinJointCount > skinJointRotations.Length)
+            {
+                throw new InvalidOperationException(
+                    $"[GenericRenderPipeline] Mesh '{item.MeshGuid:D}' pose slice {item.SkinJointOffset}+{item.SkinJointCount} " +
+                    $"is outside the frame's {skinJointRotations.Length} joint rotations.");
+            }
+
+            poseRotations = skinJointRotations.Slice(item.SkinJointOffset, item.SkinJointCount);
+        }
+
+        var destination = new Span<Matrix4x4>(
+            m_SkinPaletteMatrices,
+            m_SkinPaletteMatrixCount,
+            jointCount);
+        MeshSkinPalette.ComputePalette(
+            skin,
+            poseRotations,
+            new Span<Matrix4x4>(m_SkinPaletteJointGlobals),
+            destination);
+        m_SkinPaletteMatrixCount = requiredMatrixCapacity;
     }
 
     private void PlotStaticMeshCullingDiagnostics()
@@ -1164,7 +1285,9 @@ public class GenericRenderPipeline : RenderPipeline
         ref MeshDrawCommand[] drawCommands,
         int drawCommandCount,
         in StaticMeshRenderItem item,
-        RHIStaticMeshResource mesh)
+        RHIStaticMeshResource mesh,
+        uint skinPaletteOffset = 0,
+        uint skinJointCount = 0)
     {
         int firstSubmeshIndex = Math.Max(0, item.FirstSubmeshIndex);
         if (firstSubmeshIndex >= mesh.SubmeshCount)
@@ -1193,13 +1316,17 @@ public class GenericRenderPipeline : RenderPipeline
                 item.LocalToWorld,
                 materialId,
                 firstSubmeshIndex,
-                requestedSubmeshes)
+                requestedSubmeshes,
+                skinPaletteOffset,
+                skinJointCount)
             : mesh.CreateDrawCommandsWithMaterialOverride(
                 destination,
                 item.LocalToWorld,
                 materialId,
                 firstSubmeshIndex,
-                requestedSubmeshes);
+                requestedSubmeshes,
+                skinPaletteOffset,
+                skinJointCount);
         return drawCommandCount + written;
     }
 

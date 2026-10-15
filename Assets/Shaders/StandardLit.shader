@@ -24,6 +24,7 @@ Shader "GenericRP/StandardLit"
             #pragma shader_feature USE_NORMAL_MAP
             #pragma shader_feature ALPHA_TEST
             #pragma shader_feature USE_TRIPLANAR
+            #pragma shader_feature SKINNED
 
             [[vk::binding(0, 3)]]
             Texture2D<float4> BindlessImages[] : register(t0, space3);
@@ -78,6 +79,8 @@ Shader "GenericRP/StandardLit"
                 uint pointLightDataStart;
                 uint packedLocalLightCounts;
                 uint encodeOutputToSrgb;
+                uint skinPaletteBufferIndex;
+                uint skinPaletteOffset;
             } DrawConstants;
 
             struct VSInput
@@ -87,6 +90,10 @@ Shader "GenericRP/StandardLit"
                 float4 Tangent : TANGENT0;
                 float2 UV : TEXCOORD0;
                 float3 Color : COLOR0;
+#if SKINNED
+                uint4 Joints : TEXCOORD5;
+                float4 Weights : TEXCOORD6;
+#endif
             };
 
             struct VSOutput
@@ -156,6 +163,36 @@ Shader "GenericRP/StandardLit"
                 return result;
             }
 
+#if SKINNED
+            // Palette matrices are uploaded as four float4 rows, so row 0 holds
+            // (M11, M21, M31, M41); the vertex shader rebuilds the row-vector matrix from them.
+            float4 LoadSkinVector(uint bufferIndex, uint byteOffset)
+            {
+                return asfloat(BindlessBuffers[
+                    NonUniformResourceIndex(bufferIndex)].Load4(byteOffset));
+            }
+
+            float4x4 LoadSkinMatrix(uint bufferIndex, uint matrixIndex)
+            {
+                uint baseOffset = matrixIndex * 64u;
+                return float4x4(
+                    LoadSkinVector(bufferIndex, baseOffset + 0u),
+                    LoadSkinVector(bufferIndex, baseOffset + 16u),
+                    LoadSkinVector(bufferIndex, baseOffset + 32u),
+                    LoadSkinVector(bufferIndex, baseOffset + 48u));
+            }
+
+            float4x4 BuildSkinMatrix(VSInput input)
+            {
+                uint paletteBufferIndex = DrawConstants.skinPaletteBufferIndex;
+                uint paletteOffset = DrawConstants.skinPaletteOffset;
+                return input.Weights.x * LoadSkinMatrix(paletteBufferIndex, paletteOffset + input.Joints.x)
+                    + input.Weights.y * LoadSkinMatrix(paletteBufferIndex, paletteOffset + input.Joints.y)
+                    + input.Weights.z * LoadSkinMatrix(paletteBufferIndex, paletteOffset + input.Joints.z)
+                    + input.Weights.w * LoadSkinMatrix(paletteBufferIndex, paletteOffset + input.Joints.w);
+            }
+#endif
+
             float3 TransformDirection(float3 direction, StaticMeshObjectData objectData)
             {
                 return normalize(float3(
@@ -179,6 +216,16 @@ Shader "GenericRP/StandardLit"
                     DrawConstants.objectBufferIndex,
                     DrawConstants.objectIndex);
                 float4 localPosition = float4(input.Position, 1.0);
+                float3 localNormal = input.Normal;
+                float3 localTangent = input.Tangent.xyz;
+#if SKINNED
+                {
+                    float4x4 skinMatrix = BuildSkinMatrix(input);
+                    localPosition = mul(localPosition, skinMatrix);
+                    localNormal = mul(localNormal, (float3x3)skinMatrix);
+                    localTangent = mul(localTangent, (float3x3)skinMatrix);
+                }
+#endif
                 output.Position = float4(
                     dot(localPosition, objectData.modelViewProjectionColumn0),
                     dot(localPosition, objectData.modelViewProjectionColumn1),
@@ -186,9 +233,9 @@ Shader "GenericRP/StandardLit"
                     dot(localPosition, objectData.modelViewProjectionColumn3));
                 output.UV = input.UV;
                 output.Color = input.Color;
-                output.WorldNormal = TransformDirection(input.Normal, objectData);
+                output.WorldNormal = TransformDirection(localNormal, objectData);
 #if USE_NORMAL_MAP
-                output.WorldTangent = TransformDirection(input.Tangent.xyz, objectData);
+                output.WorldTangent = TransformDirection(localTangent, objectData);
                 output.TangentSign = input.Tangent.w;
 #endif
                 output.WorldPosition = TransformPosition(localPosition, objectData);

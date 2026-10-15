@@ -66,6 +66,10 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
     private RHIImageViewHandle m_ColorTargetImageView = RHIImageViewHandle.Invalid;
     private EFormat m_ColorTargetFormat = EFormat.FORMAT_UNDEFINED;
     private bool m_EncodeOutputToSrgb;
+    private RHIBufferHandle m_SkinPaletteBuffer = RHIBufferHandle.Invalid;
+    private uint m_SkinPaletteBufferBindlessIndex = InvalidBindlessIndex;
+    private bool m_HasSkinPaletteData;
+    private bool m_HasSkinnedDraws;
     private EFormat m_ColorFormat = EFormat.FORMAT_UNDEFINED;
     private EFormat m_DepthFormat = EFormat.FORMAT_UNDEFINED;
     private RHIImageViewHandle m_DepthImageView = RHIImageViewHandle.Invalid;
@@ -298,6 +302,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         var colorImageView = GetColorTargetImageView(context);
 
         RecordObjectDataBarrier(commandList);
+        RecordSkinPaletteBarrier(commandList);
         BeginStaticMeshRendering(
             context,
             commandList,
@@ -339,7 +344,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
                 checked((uint)drawIndex),
                 checked((uint)m_PointLightDataStart),
                 PackLocalLightCounts(m_PointLightCount, m_SpotLightCount),
-                m_EncodeOutputToSrgb);
+                m_EncodeOutputToSrgb,
+                draw.IsSkinned ? m_SkinPaletteBufferBindlessIndex : StaticMeshDrawConstants.InvalidSkinPaletteIndex,
+                draw.IsSkinned ? draw.SkinPaletteOffset : 0u);
 
             commandList.PushConstants(
                 constants,
@@ -403,6 +410,14 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         }
 
         EnsurePipelineBatches(context, colorFormat, depthFormat);
+        m_HasSkinnedDraws = HasSkinnedDraws();
+        if (m_HasSkinnedDraws && !m_HasSkinPaletteData)
+        {
+            throw new InvalidOperationException(
+                $"[{Name}] Prepared draws reference a skin palette, but the frame uploaded no palette data. " +
+                "Skinned draws must be prepared with their palette block.");
+        }
+
         BuildDrawBatches(context);
         PrepareObjectDataBuffer(context, factory);
         PlotBatchDiagnostics();
@@ -423,6 +438,18 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
 
         drawCommands.CopyTo(m_PreparedDraws);
         m_PreparedDrawCount = drawCommands.Length;
+    }
+
+    /// <summary>
+    /// Hands the pass the frame's skin palette storage. A pass that draws skinned meshes reads the
+    /// palette through the bindless table, so only the buffer handle, its bindless index, and
+    /// whether the frame uploaded matrices are required.
+    /// </summary>
+    public void SetPreparedSkinning(RHIBufferHandle paletteBuffer, uint paletteBindlessIndex, bool hasData)
+    {
+        m_SkinPaletteBuffer = hasData ? paletteBuffer : RHIBufferHandle.Invalid;
+        m_SkinPaletteBufferBindlessIndex = hasData ? paletteBindlessIndex : InvalidBindlessIndex;
+        m_HasSkinPaletteData = hasData;
     }
 
     internal void SetDepthTarget(
@@ -492,7 +519,8 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
                 slot.RenderState,
                 m_Configuration.DepthWriteEnabled,
                 colorFormat,
-                depthFormat);
+                depthFormat,
+                Skinned: false);
             int batchIndex = FindPipelineBatch(key);
             if (batchIndex < 0)
             {
@@ -500,6 +528,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             }
 
             slot.PipelineBatchIndex = batchIndex;
+            slot.SkinnedPipelineBatchIndex = -1;
             m_MaterialSlots[i] = slot;
 
             if (i == 0 && m_Configuration.EnableFallbackMesh)
@@ -551,13 +580,20 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             batch.PipelineState.ClearVertexInputDescriptions();
             batch.PipelineState.AddVertexBindingDescription(
                 0,
-                MeshAssetCooker.StaticMeshVertexStride,
+                key.Skinned
+                    ? MeshAssetCooker.SkinnedMeshVertexStride
+                    : MeshAssetCooker.StaticMeshVertexStride,
                 EVertexInputRate.VERTEX_INPUT_RATE_VERTEX);
             batch.PipelineState.AddVertexInputAttributeDescription(0, 0, EFormat.FORMAT_R32G32B32_SFLOAT, 0);
             batch.PipelineState.AddVertexInputAttributeDescription(1, 0, EFormat.FORMAT_R32G32B32_SFLOAT, 12);
             batch.PipelineState.AddVertexInputAttributeDescription(2, 0, EFormat.FORMAT_R32G32B32A32_SFLOAT, 24);
             batch.PipelineState.AddVertexInputAttributeDescription(3, 0, EFormat.FORMAT_R32G32_SFLOAT, 40);
             batch.PipelineState.AddVertexInputAttributeDescription(4, 0, EFormat.FORMAT_R32G32B32_SFLOAT, 48);
+            if (key.Skinned)
+            {
+                batch.PipelineState.AddVertexInputAttributeDescription(5, 0, EFormat.FORMAT_R8G8B8A8_UINT, 60);
+                batch.PipelineState.AddVertexInputAttributeDescription(6, 0, EFormat.FORMAT_R32G32B32A32_SFLOAT, 64);
+            }
             batch.PipelineState.SetRasterizationState(
                 EPolygonMode.EPOLYGON_MODE_FILL,
                 key.RenderState.CullMode,
@@ -584,7 +620,7 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             int batchIndex = m_PipelineBatchCount++;
             m_PipelineBatches[batchIndex] = batch;
             Logger.Log(
-                $"[{Name}] Created pipeline batch | Batch: {batchIndex} | Shader: {key.ShaderGuid} | Format: {key.ColorFormat} | Cull: {key.RenderState.CullMode} | Blend: {key.RenderState.BlendEnabled} | DepthWrite: {key.DepthWriteEnabled} | Pipeline: {batch.Pipeline.Index}:{batch.Pipeline.Generation}");
+                $"[{Name}] Created pipeline batch | Batch: {batchIndex} | Shader: {key.ShaderGuid} | Format: {key.ColorFormat} | Cull: {key.RenderState.CullMode} | Blend: {key.RenderState.BlendEnabled} | DepthWrite: {key.DepthWriteEnabled} | Skinned: {key.Skinned} | Pipeline: {batch.Pipeline.Index}:{batch.Pipeline.Generation}");
             return batchIndex;
         }
         catch
@@ -642,7 +678,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
                 continue;
             }
 
-            int batchIndex = GetMaterialPipelineBatchIndex(draw.MaterialID);
+            int batchIndex = draw.IsSkinned
+                ? ResolveSkinnedPipelineBatch(draw.MaterialID, context)
+                : GetMaterialPipelineBatchIndex(draw.MaterialID);
             if (batchIndex >= 0)
             {
                 m_BatchedDrawSortKeys[sortedDrawCount] = StaticMeshDrawSortKey.From(
@@ -857,7 +895,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             0,
             checked((uint)m_PointLightDataStart),
             PackLocalLightCounts(m_PointLightCount, m_SpotLightCount),
-            m_EncodeOutputToSrgb);
+            m_EncodeOutputToSrgb,
+            StaticMeshDrawConstants.InvalidSkinPaletteIndex,
+            0u);
         m_VertexBuffer = mesh.VertexBuffer;
         m_IndexBuffer = mesh.IndexBuffer;
         m_IndexType = mesh.IndexType;
@@ -883,6 +923,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         int previousPipelineBatchIndex = m_MaterialSlots[slotIndex].IsValid
             ? m_MaterialSlots[slotIndex].PipelineBatchIndex
             : -1;
+        int previousSkinnedPipelineBatchIndex = m_MaterialSlots[slotIndex].IsValid
+            ? m_MaterialSlots[slotIndex].SkinnedPipelineBatchIndex
+            : -1;
         var renderQueue = RenderQueuePolicy.Resolve(material.RenderState, material.Shader.VariantKeywords);
         var pipelineSignature = new StaticMeshMaterialPipelineSignature(
             material.Shader.Guid,
@@ -894,7 +937,8 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             material.Shader,
             pipelineSignature,
             CreateMaterialConstants(material),
-            previousPipelineBatchIndex);
+            previousPipelineBatchIndex,
+            previousSkinnedPipelineBatchIndex);
 
         var previousSlot = m_MaterialSlots[slotIndex];
         if (previousSlot.Equals(slot))
@@ -1369,7 +1413,9 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
             0,
             checked((uint)m_PointLightDataStart),
             PackLocalLightCounts(m_PointLightCount, m_SpotLightCount),
-            m_EncodeOutputToSrgb);
+            m_EncodeOutputToSrgb,
+            StaticMeshDrawConstants.InvalidSkinPaletteIndex,
+            0u);
     }
 
     private static uint PackLocalLightCounts(int pointLightCount, int spotLightCount)
@@ -1440,6 +1486,108 @@ public sealed class StaticMeshPass : RenderPassNode, IDisposable
         }
 
         return m_FallbackMaterialConstants;
+    }
+
+    private bool HasSkinnedDraws()
+    {
+        for (int drawIndex = 0; drawIndex < m_PreparedDrawCount; drawIndex++)
+        {
+            if (m_PreparedDraws[drawIndex].IsSkinned)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Skin palettes are a mesh property rather than a material keyword, so a skinned draw compiles
+    /// the material's shader once more with the SKINNED keyword and keeps that pipeline beside the
+    /// material's static one. The first skinned draw pays for the variant; later draws reuse it.
+    /// </summary>
+    private int ResolveSkinnedPipelineBatch(uint materialId, RenderContext context)
+    {
+        if (materialId >= (uint)m_MaterialSlots.Length)
+        {
+            return -1;
+        }
+
+        var slot = m_MaterialSlots[materialId];
+        if (!slot.IsValid ||
+            slot.Shader == null ||
+            !m_Configuration.Accepts(slot.RenderQueue.Class))
+        {
+            return -1;
+        }
+
+        if (slot.SkinnedPipelineBatchIndex >= 0)
+        {
+            return slot.SkinnedPipelineBatchIndex;
+        }
+
+        ShaderAsset skinnedShader = MeshSkinningShaderVariant.Create(slot.Shader);
+        var key = new StaticMeshPipelineKey(
+            skinnedShader.Guid,
+            slot.ShaderDependencyStamp,
+            skinnedShader.GetVariantIdentity(),
+            slot.RenderState,
+            m_Configuration.DepthWriteEnabled,
+            m_ColorFormat,
+            m_DepthFormat,
+            Skinned: true);
+        int batchIndex = FindPipelineBatch(key);
+        if (batchIndex < 0)
+        {
+            try
+            {
+                batchIndex = CreatePipelineBatch(context.Device.PipelineCache, key, skinnedShader);
+            }
+            catch (Exception exception) when (
+                exception is InvalidOperationException or
+                NotSupportedException or
+                FileNotFoundException or
+                DirectoryNotFoundException)
+            {
+                throw new InvalidOperationException(
+                    $"[{Name}] Material '{materialId}' is used by a skinned mesh, but its shader " +
+                    $"'{slot.Shader.Guid:D}' could not produce the SKINNED variant. Declare " +
+                    "'#pragma shader_feature SKINNED' and cook that variant for cooked-only runs.",
+                    exception);
+            }
+        }
+
+        slot.SkinnedPipelineBatchIndex = batchIndex;
+        m_MaterialSlots[materialId] = slot;
+        Logger.Log($"[{Name}] Prepared skinned pipeline batch | Material: {materialId} | Batch: {batchIndex}");
+        return batchIndex;
+    }
+
+    private void RecordSkinPaletteBarrier(RenderCommandList commandList)
+    {
+        if (!m_HasSkinnedDraws || !m_SkinPaletteBuffer.IsValid || !m_HasSkinPaletteData)
+        {
+            return;
+        }
+
+        Span<RHIBufferMemoryBarrier> barriers = stackalloc RHIBufferMemoryBarrier[1];
+        barriers[0] = new RHIBufferMemoryBarrier
+        {
+            SrcAccessMask = EAccessFlag.ACCESS_HOST_WRITE_BIT,
+            DstAccessMask = EAccessFlag.ACCESS_SHADER_READ_BIT,
+            SrcQueueFamilyIndex = RHIQueueFamily.Ignored,
+            DstQueueFamilyIndex = RHIQueueFamily.Ignored,
+            Buffer = m_SkinPaletteBuffer,
+            SrcStageMask = EPipelineStageFlagBits.PIPELINE_STAGE_HOST_BIT,
+            DstStageMask = EPipelineStageFlagBits.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                           EPipelineStageFlagBits.PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+        };
+
+        commandList.PipelineBarrier(
+            EPipelineStageFlagBits.PIPELINE_STAGE_HOST_BIT,
+            EPipelineStageFlagBits.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            EPipelineStageFlagBits.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            barriers);
     }
 
     private int GetMaterialPipelineBatchIndex(uint materialId)
@@ -1559,7 +1707,8 @@ internal readonly record struct StaticMeshPipelineKey(
     MaterialRenderState RenderState,
     bool DepthWriteEnabled,
     EFormat ColorFormat,
-    EFormat DepthFormat);
+    EFormat DepthFormat,
+    bool Skinned);
 
 internal struct StaticMeshPipelineBatch
 {
@@ -1733,18 +1882,21 @@ internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
     public RenderQueueInfo RenderQueue => PipelineSignature.RenderQueue;
     public readonly StaticMeshMaterialConstants Constants;
     public int PipelineBatchIndex;
+    public int SkinnedPipelineBatchIndex;
     public readonly bool IsValid;
 
     public StaticMeshMaterialSlot(
         ShaderAsset shader,
         StaticMeshMaterialPipelineSignature pipelineSignature,
         StaticMeshMaterialConstants constants,
-        int pipelineBatchIndex)
+        int pipelineBatchIndex,
+        int skinnedPipelineBatchIndex)
     {
         Shader = shader;
         PipelineSignature = pipelineSignature;
         Constants = constants;
         PipelineBatchIndex = pipelineBatchIndex;
+        SkinnedPipelineBatchIndex = skinnedPipelineBatchIndex;
         IsValid = true;
     }
 
@@ -1754,7 +1906,8 @@ internal struct StaticMeshMaterialSlot : IEquatable<StaticMeshMaterialSlot>
                ReferenceEquals(Shader, other.Shader) &&
                PipelineSignature == other.PipelineSignature &&
                Constants.Equals(other.Constants) &&
-               PipelineBatchIndex == other.PipelineBatchIndex;
+               PipelineBatchIndex == other.PipelineBatchIndex &&
+               SkinnedPipelineBatchIndex == other.SkinnedPipelineBatchIndex;
     }
 
     public override bool Equals(object? obj)
@@ -2055,7 +2208,9 @@ internal readonly struct StaticMeshDrawConstants
 {
     private const uint InvalidBindlessIndex = 0xFFFFFFFFu;
 
-    public static StaticMeshDrawConstants Identity => From(Vector4.One, StaticMeshLightingConstants.Default, Vector3.Zero, 0.0f, 1.0f, 0, 0, 0, 0, InvalidBindlessIndex, 0, 0, 0, false);
+    public const uint InvalidSkinPaletteIndex = InvalidBindlessIndex;
+
+    public static StaticMeshDrawConstants Identity => From(Vector4.One, StaticMeshLightingConstants.Default, Vector3.Zero, 0.0f, 1.0f, 0, 0, 0, 0, InvalidBindlessIndex, 0, 0, 0, false, InvalidSkinPaletteIndex, 0u);
 
     public readonly Vector4 BaseColorFactor;
     public readonly Vector4 LightDirectionIntensity;
@@ -2073,6 +2228,8 @@ internal readonly struct StaticMeshDrawConstants
     public readonly uint PointLightDataStart;
     public readonly uint PackedLocalLightCounts;
     public readonly uint EncodeOutputToSrgb;
+    public readonly uint SkinPaletteBufferIndex;
+    public readonly uint SkinPaletteOffset;
 
     private StaticMeshDrawConstants(
         Vector4 baseColorFactor,
@@ -2088,7 +2245,9 @@ internal readonly struct StaticMeshDrawConstants
         uint objectIndex,
         uint pointLightDataStart,
         uint packedLocalLightCounts,
-        bool encodeOutputToSrgb)
+        bool encodeOutputToSrgb,
+        uint skinPaletteBufferIndex,
+        uint skinPaletteOffset)
     {
         BaseColorFactor = baseColorFactor;
         LightDirectionIntensity = lightingConstants.DirectionIntensity;
@@ -2106,6 +2265,8 @@ internal readonly struct StaticMeshDrawConstants
         PointLightDataStart = pointLightDataStart;
         PackedLocalLightCounts = packedLocalLightCounts;
         EncodeOutputToSrgb = encodeOutputToSrgb ? 1u : 0u;
+        SkinPaletteBufferIndex = skinPaletteBufferIndex;
+        SkinPaletteOffset = skinPaletteOffset;
     }
 
     public static StaticMeshDrawConstants From(
@@ -2122,7 +2283,9 @@ internal readonly struct StaticMeshDrawConstants
         uint objectIndex,
         uint pointLightDataStart,
         uint packedLocalLightCounts,
-        bool encodeOutputToSrgb)
+        bool encodeOutputToSrgb,
+        uint skinPaletteBufferIndex,
+        uint skinPaletteOffset)
     {
         return new StaticMeshDrawConstants(
             baseColorFactor,
@@ -2138,7 +2301,9 @@ internal readonly struct StaticMeshDrawConstants
             objectIndex,
             pointLightDataStart,
             packedLocalLightCounts,
-            encodeOutputToSrgb);
+            encodeOutputToSrgb,
+            skinPaletteBufferIndex,
+            skinPaletteOffset);
     }
 }
 
