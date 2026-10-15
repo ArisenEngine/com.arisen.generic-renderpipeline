@@ -86,8 +86,11 @@ internal sealed class GenericSkinPaletteBuffer : IDisposable
         int ringSize = ResolveRingSize(context);
         EnsureRing(factory, ringSize);
         m_SlotIndex = checked((int)(context.FrameResourceIndex % (uint)m_RingSize));
-        EnsureSlotBuffer(factory, m_SlotIndex, m_MatrixCount);
-        Upload(m_MatrixCount);
+        EnsureSlotBuffer(factory, m_SlotIndex, matrixCount: palettes.Length);
+        Upload(palettes.Length);
+        // A ring rebuild releases the slots but not the frame's palettes, so the count the frame
+        // prepared is what the buffer reports after every path through this method.
+        m_MatrixCount = palettes.Length;
         m_HasData = true;
         Profiler.PlotValue("GenericRP.SkinPaletteMatrixCount", m_MatrixCount);
     }
@@ -119,6 +122,22 @@ internal sealed class GenericSkinPaletteBuffer : IDisposable
 
     public void Release()
     {
+        ReleaseSlots();
+        m_Capacity = 0;
+        m_MatrixCount = 0;
+        m_HasData = false;
+        Buffer = RHIBufferHandle.Invalid;
+        BindlessIndex = InvalidBindlessIndex;
+    }
+
+    /// <summary>
+    /// Releases the per-frame ring slots and their GPU buffers. The ring is storage for the frame's
+    /// palette, not the palette itself: the uploaded matrices and the frame's matrix count survive,
+    /// which is what lets <see cref="EnsureRing"/> rebuild the ring mid-frame without discarding the
+    /// block the frame is about to upload.
+    /// </summary>
+    private void ReleaseSlots()
+    {
         for (int slotIndex = 0; slotIndex < m_Slots.Length; slotIndex++)
         {
             ReleaseSlot(slotIndex);
@@ -127,11 +146,6 @@ internal sealed class GenericSkinPaletteBuffer : IDisposable
         m_Slots = Array.Empty<Slot>();
         m_RingSize = 0;
         m_SlotIndex = 0;
-        m_Capacity = 0;
-        m_MatrixCount = 0;
-        m_HasData = false;
-        Buffer = RHIBufferHandle.Invalid;
-        BindlessIndex = InvalidBindlessIndex;
     }
 
     public void Dispose()
@@ -183,7 +197,7 @@ internal sealed class GenericSkinPaletteBuffer : IDisposable
             return;
         }
 
-        Release();
+        ReleaseSlots();
         m_Factory = factory;
         m_Slots = new Slot[ringSize];
         m_RingSize = ringSize;
