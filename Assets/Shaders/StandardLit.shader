@@ -175,11 +175,19 @@ Shader "GenericRP/StandardLit"
             float4x4 LoadSkinMatrix(uint bufferIndex, uint matrixIndex)
             {
                 uint baseOffset = matrixIndex * 64u;
+                // The palette stores a matrix the way the CPU composes it in its row-vector
+                // convention: float4 #0 is (M11, M21, M31, M41), i.e. the matrix's first column.
+                // float4x4(...) takes its arguments as rows, so the loaded vectors are gathered
+                // element-wise into the rows mul(v, M) consumes.
+                float4 column0 = LoadSkinVector(bufferIndex, baseOffset + 0u);
+                float4 column1 = LoadSkinVector(bufferIndex, baseOffset + 16u);
+                float4 column2 = LoadSkinVector(bufferIndex, baseOffset + 32u);
+                float4 column3 = LoadSkinVector(bufferIndex, baseOffset + 48u);
                 return float4x4(
-                    LoadSkinVector(bufferIndex, baseOffset + 0u),
-                    LoadSkinVector(bufferIndex, baseOffset + 16u),
-                    LoadSkinVector(bufferIndex, baseOffset + 32u),
-                    LoadSkinVector(bufferIndex, baseOffset + 48u));
+                    float4(column0.x, column1.x, column2.x, column3.x),
+                    float4(column0.y, column1.y, column2.y, column3.y),
+                    float4(column0.z, column1.z, column2.z, column3.z),
+                    float4(column0.w, column1.w, column2.w, column3.w));
             }
 
             float4x4 BuildSkinMatrix(VSInput input)
