@@ -601,6 +601,7 @@ public class GenericRenderPipeline : RenderPipeline
             device,
             context.StaticMeshItems,
             context.SkinJointRotations,
+            context.SkinJointTranslations,
             GetViewProjection(context),
             context.CameraCount > 0);
     }
@@ -1037,6 +1038,7 @@ public class GenericRenderPipeline : RenderPipeline
         RHIDevice device,
         ReadOnlySpan<StaticMeshRenderItem> items,
         ReadOnlySpan<Quaternion> skinJointRotations,
+        ReadOnlySpan<Vector3> skinJointTranslations,
         Matrix4x4 viewProjection,
         bool enableFrustumCulling)
     {
@@ -1076,7 +1078,7 @@ public class GenericRenderPipeline : RenderPipeline
             {
                 skinPaletteOffset = checked((uint)m_SkinPaletteMatrixCount);
                 skinJointCount = checked((uint)mesh.SkinJointCount);
-                AppendSkinPaletteBlock(mesh, item, skinJointRotations);
+                AppendSkinPaletteBlock(mesh, item, skinJointRotations, skinJointTranslations);
             }
 
             m_SceneItemSkinPaletteOffsets[i] = checked((int)skinPaletteOffset);
@@ -1124,7 +1126,8 @@ public class GenericRenderPipeline : RenderPipeline
     private void AppendSkinPaletteBlock(
         RHIStaticMeshResource mesh,
         in StaticMeshRenderItem item,
-        ReadOnlySpan<Quaternion> skinJointRotations)
+        ReadOnlySpan<Quaternion> skinJointRotations,
+        ReadOnlySpan<Vector3> skinJointTranslations)
     {
         MeshSkin? skin = mesh.Skin;
         if (skin == null)
@@ -1164,6 +1167,28 @@ public class GenericRenderPipeline : RenderPipeline
             poseRotations = skinJointRotations.Slice(item.SkinJointOffset, item.SkinJointCount);
         }
 
+        ReadOnlySpan<Vector3> poseTranslations = ReadOnlySpan<Vector3>.Empty;
+        if (item.SkinTranslationCount > 0)
+        {
+            if (item.SkinTranslationCount != jointCount)
+            {
+                throw new InvalidOperationException(
+                    $"[GenericRenderPipeline] Mesh '{item.MeshGuid:D}' cooks {jointCount} joints, but the entity posed " +
+                    $"{item.SkinTranslationCount} translations. A pose must address the cooked skeleton.");
+            }
+
+            if (item.SkinTranslationOffset < 0 ||
+                item.SkinTranslationOffset + item.SkinTranslationCount > skinJointTranslations.Length)
+            {
+                throw new InvalidOperationException(
+                    $"[GenericRenderPipeline] Mesh '{item.MeshGuid:D}' translation slice " +
+                    $"{item.SkinTranslationOffset}+{item.SkinTranslationCount} is outside the frame's " +
+                    $"{skinJointTranslations.Length} joint translations.");
+            }
+
+            poseTranslations = skinJointTranslations.Slice(item.SkinTranslationOffset, item.SkinTranslationCount);
+        }
+
         var destination = new Span<Matrix4x4>(
             m_SkinPaletteMatrices,
             m_SkinPaletteMatrixCount,
@@ -1171,6 +1196,7 @@ public class GenericRenderPipeline : RenderPipeline
         MeshSkinPalette.ComputePalette(
             skin,
             poseRotations,
+            poseTranslations,
             new Span<Matrix4x4>(m_SkinPaletteJointGlobals),
             destination);
         m_SkinPaletteMatrixCount = requiredMatrixCapacity;
